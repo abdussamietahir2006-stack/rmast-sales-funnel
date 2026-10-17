@@ -34,7 +34,8 @@ writing. All commands below run from `rmast-sales-engine/`.
 
 - **Inbox mode** (the pre-9 PM run, or "check replies"): steps 0 and 1.
 - **Leads mode** (the 9 PM run, or "get leads"): steps 0, 2, 3, 4 and 5,
-  within about **1.25 minutes per lead** (see "Time and usage budget").
+  aiming for about **1.25 minutes per lead**, and always finishing every lead
+  (see "Time and usage budget").
 - Asked to "run the sales engine" without a mode: do both, inbox first.
 
 ## 0. Make sure the engine can reach the app
@@ -205,10 +206,14 @@ leads removed, bounces, and anything that failed.
 The operator's weekly Claude usage is limited, and it is spent by work
 (searches, pages read, text written), not by the clock. Keep every lead lean.
 
-- **Time limit:** `today.totalLeads × 1.25` minutes, rounded up (20 leads → 25
-  minutes), counted from the start of the run. At the limit, finish the lead
-  you're on, log the run, and stop. Anything unfinished stays queued for
-  tomorrow.
+- **Time target:** `today.totalLeads × 1.25` minutes, rounded up (20 leads →
+  25 minutes), counted from the start of the run. **Every one of today's leads
+  must still be finished tonight.** If you pass the target with leads left,
+  switch to **fast mode** for the rest: about 4 searches or fetches per lead
+  (find the business with its email, the license lookup, one combined social
+  search, one look at their site), the shortest sections the schemas allow,
+  and no second attempts at hard-to-find details (leave them empty). Keep
+  every gate: active, an email, and at least one social profile.
 - **Work alone, in order.** Don't use the Agent tool or parallel workers:
   each worker re-reads all these instructions, which costs more usage than
   it saves.
