@@ -72,6 +72,10 @@ function extractImages(html: string, base: string): { logoUrl?: string; images: 
         if (!raw) return;
         const url = resolveUrl(raw, base);
         if (!url || seen.has(url) || SKIP_IMAGE_RE.test(url) || /logo/i.test(url)) return;
+        // Site builders (Duda, Wix) name resized copies like "photo-300w.jpg";
+        // a thumbnail that small looks blurry stretched across a hero.
+        const sizeHint = url.match(/[-_](\d{2,4})w\.(jpe?g|png|webp)/i);
+        if (sizeHint && Number(sizeHint[1]) < 800) return;
         seen.add(url);
         images.push(url);
     };
