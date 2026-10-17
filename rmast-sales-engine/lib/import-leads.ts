@@ -344,8 +344,27 @@ export async function insertImportedLeads(
         .toArray();
     const existingKeys = new Set(existing.map((doc) => doc.dedupeKey as string));
 
+    // Leads removed after unanswered follow-ups, and anyone who unsubscribed,
+    // must never come back in and be contacted again.
+    const emails = candidates.map((c) => c.email.toLowerCase()).filter(Boolean);
+    const [retired, suppressed] = await Promise.all([
+        db
+            .collection("retiredLeads")
+            .find(
+                { $or: [{ dedupeKey: { $in: candidates.map((c) => c.dedupeKey) } }, { email: { $in: emails } }] },
+                { projection: { dedupeKey: 1, email: 1 } }
+            )
+            .toArray(),
+        db.collection("suppressions").find({ email: { $in: emails } }, { projection: { email: 1 } }).toArray(),
+    ]);
+    const blockedKeys = new Set(retired.map((r) => r.dedupeKey as string).filter(Boolean));
+    const blockedEmails = new Set(
+        [...retired.map((r) => r.email as string), ...suppressed.map((s) => s.email as string)].filter(Boolean)
+    );
+
     const toInsert = candidates
         .filter((c) => !existingKeys.has(c.dedupeKey))
+        .filter((c) => !blockedKeys.has(c.dedupeKey) && !blockedEmails.has(c.email.toLowerCase()))
         .map((c) => ({
             companyName: c.companyName,
             niche: c.niche,

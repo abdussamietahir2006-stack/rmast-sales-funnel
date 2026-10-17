@@ -8,6 +8,6 @@ export interface Appointment {
     timeline?: string;
     status: "Scheduled" | "Completed" | "Cancelled";
     /** Where the booking came from — the public audit page or the dashboard. */
-    source?: "audit_page" | "operator";
+    source?: "audit_page" | "operator" | "engine";
     createdAt: string;
 }

@@ -16,6 +16,7 @@ import {
     applyOutreach,
     checkWebsiteReachable,
     getLead,
+    logActivity,
     scrapeHomepageSnippet,
     type StepResult,
 } from "@/lib/pipeline";
@@ -215,85 +216,142 @@ export async function addLeads(db: Db, raw: unknown, campaignId?: string) {
 export async function logEngineRun(db: Db, summary: string) {
     await db.collection("engine_runs").insertOne({ summary, ranAt: new Date().toISOString() });
 }
+// --- Email: replies, conversations, follow-ups, meetings ----------------------
+//
+// First contact is always the operator's. From then on, email is the engine's:
+//   - no reply: a follow-up every FOLLOW_UP_EVERY_DAYS, up to MAX_FOLLOW_UPS,
+//     then the lead is retired (deleted, and remembered so it's never re-added)
+//   - a reply: the engine answers in the same thread and works toward booking
+//     a meeting, which it records once confirmed.
+// Every rule that limits sending is enforced here, not in the engine's
+// instructions, so no prompt mistake can over-send.
 
-// --- Email replies and follow-ups -------------------------------------------
-
-/** Days to wait after the previous email before each follow-up: the first
- *  follow-up 3 days after the opening email, the second 5 days after that.
- *  Its length is the maximum number of follow-ups. */
-export const FOLLOW_UP_DELAYS_DAYS = [3, 5];
+export const FOLLOW_UP_EVERY_DAYS = 3;
+export const MAX_FOLLOW_UPS = 4;
+/** After the last follow-up, how long to wait for a reply before retiring. */
+export const RETIRE_AFTER_DAYS = 3;
+/** Gentle nudges allowed in a conversation that went quiet after a reply. */
+export const MAX_CONVERSATION_NUDGES = 2;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+interface ThreadMessage {
+    direction: "outbound" | "inbound";
+    content: string;
+    sentAt: string;
+    providerMessageId?: string;
+    internetMessageId?: string;
+    sentiment?: string;
+}
 
 function subjectOf(content: string, companyName: string): string {
     const match = content.match(/^\s*subject:\s*(.+?)\r?\n/i);
     return match ? match[1].trim() : `A quick note about ${companyName}`;
 }
 
+/** SMTP Message-IDs look like <...@...>; Resend ids and Gmail API ids don't. */
+function asMessageId(value?: string): string | undefined {
+    return value && /^<.+@.+>$/.test(value) ? value : undefined;
+}
+
 /**
- * Every lead that has been emailed, with what the engine needs to decide its
- * next step: has it replied, how many follow-ups went out, and is the next
- * follow-up due. Leads that replied or opted out are never due.
+ * Every lead that has been emailed, with its whole email thread and the next
+ * step the engine may take: a follow-up, a reply in the conversation, or
+ * retiring the lead.
  */
 export async function getEmailThreads(db: Db) {
-    const threads = await db
+    const grouped = await db
         .collection("messages")
-        .aggregate<{
-            _id: string;
-            outbound: { content: string; sentAt: string; providerMessageId?: string }[];
-            inboundCount: number;
-            lastInboundAt: string | null;
-        }>([
+        .aggregate<{ _id: string; messages: ThreadMessage[] }>([
             { $match: { channel: "email" } },
             { $sort: { sentAt: 1 } },
             {
                 $group: {
                     _id: "$leadId",
-                    outbound: {
+                    messages: {
                         $push: {
-                            $cond: [{ $eq: ["$direction", "outbound"] }, { content: "$content", sentAt: "$sentAt", providerMessageId: "$providerMessageId" }, "$$REMOVE"],
+                            direction: "$direction",
+                            content: "$content",
+                            sentAt: "$sentAt",
+                            providerMessageId: "$providerMessageId",
+                            internetMessageId: "$internetMessageId",
+                            sentiment: "$sentiment",
                         },
                     },
-                    inboundCount: { $sum: { $cond: [{ $eq: ["$direction", "inbound"] }, 1, 0] } },
-                    lastInboundAt: { $max: { $cond: [{ $eq: ["$direction", "inbound"] }, "$sentAt", null] } },
                 },
             },
-            { $match: { "outbound.0": { $exists: true } } },
         ])
         .toArray();
 
-    const leads = await getLeadsByIds(db, threads.map((t) => t._id));
+    const leads = await getLeadsByIds(db, grouped.map((t) => t._id));
+    const appointments = await db
+        .collection("appointments")
+        .find({ leadId: { $in: grouped.map((t) => t._id) }, status: "Scheduled" })
+        .toArray();
+    const meetingByLead = new Map(appointments.map((a) => [String(a.leadId), a.scheduledAt as string]));
     const now = Date.now();
 
-    return threads
+    return grouped
         .map((thread) => {
             const lead = leads.get(thread._id);
-            if (!lead) return null;
-            const followUpsSent = thread.outbound.length - 1;
-            const lastEmailAt = thread.outbound[thread.outbound.length - 1].sentAt;
-            const daysSinceLastEmail = Math.floor((now - Date.parse(lastEmailAt)) / DAY_MS);
-            const replied = thread.inboundCount > 0;
-            const nextDelay = FOLLOW_UP_DELAYS_DAYS[followUpsSent];
+            const outbound = thread.messages.filter((m) => m.direction === "outbound");
+            if (!lead || outbound.length === 0) return null;
+
+            const inbound = thread.messages.filter((m) => m.direction === "inbound");
+            const replied = inbound.length > 0;
+            const last = thread.messages[thread.messages.length - 1];
+            const daysSinceLastMessage = Math.floor((now - Date.parse(last.sentAt)) / DAY_MS);
+            const optedOut = Boolean(lead.optedOut);
+
+            // Before any reply: follow-ups are the outbound emails after the first.
+            const followUpsSent = replied ? 0 : outbound.length - 1;
+            // After a reply: our messages since their latest reply, unanswered.
+            const lastInboundAt = replied ? inbound[inbound.length - 1].sentAt : null;
+            const unansweredOurs = replied
+                ? outbound.filter((m) => m.sentAt > (lastInboundAt as string)).length
+                : 0;
+            const meetingAt = meetingByLead.get(thread._id) || null;
+
             return {
                 id: thread._id,
                 companyName: lead.companyName,
                 ownerName: lead.ownerName || "",
                 email: lead.email || "",
+                location: lead.location || "",
                 status: lead.status,
-                optedOut: Boolean(lead.optedOut),
+                optedOut,
                 replied,
-                lastReplyAt: thread.lastInboundAt,
-                originalSubject: subjectOf(thread.outbound[0].content, lead.companyName),
-                emailsSent: thread.outbound.map((m) => ({ sentAt: m.sentAt, content: m.content })),
-                // An SMTP Message-ID (<...@...>) of the opening email, when it was
-                // sent through Gmail, so follow-ups can thread under it.
-                threadMessageId: /^<.+@.+>$/.test(thread.outbound[0].providerMessageId || "")
-                    ? thread.outbound[0].providerMessageId
-                    : undefined,
+                meetingBookedFor: meetingAt,
+                originalSubject: subjectOf(outbound[0].content, lead.companyName),
+                messages: thread.messages.map((m) => ({
+                    direction: m.direction,
+                    sentAt: m.sentAt,
+                    content: m.content,
+                    ...(m.sentiment ? { sentiment: m.sentiment } : {}),
+                })),
+                lastMessageFrom: last.direction === "inbound" ? "lead" : "us",
+                daysSinceLastMessage,
                 followUpsSent,
-                lastEmailAt,
-                daysSinceLastEmail,
+                // Their reply is the latest message and nothing has answered it.
+                needsReply: replied && !optedOut && last.direction === "inbound",
                 followUpDue:
-                    !replied && !lead.optedOut && nextDelay !== undefined && daysSinceLastEmail >= nextDelay,
+                    !replied &&
+                    !optedOut &&
+                    followUpsSent < MAX_FOLLOW_UPS &&
+                    daysSinceLastMessage >= FOLLOW_UP_EVERY_DAYS,
+                // A conversation that went quiet on their side after our answer.
+                nudgeDue:
+                    replied &&
+                    !optedOut &&
+                    !meetingAt &&
+                    last.direction === "outbound" &&
+                    unansweredOurs <= MAX_CONVERSATION_NUDGES &&
+                    daysSinceLastMessage >= FOLLOW_UP_EVERY_DAYS,
+                retireDue:
+                    !replied && followUpsSent >= MAX_FOLLOW_UPS && daysSinceLastMessage >= RETIRE_AFTER_DAYS,
+                // The latest Message-ID in the thread, so whatever we send next
+                // threads under it in their inbox.
+                replyToMessageId:
+                    [...thread.messages].reverse().map((m) => asMessageId(m.internetMessageId) || (m.direction === "outbound" ? asMessageId(m.providerMessageId) : undefined)).find(Boolean),
             };
         })
         .filter((t) => t !== null);
@@ -308,17 +366,27 @@ async function getLeadsByIds(db: Db, ids: string[]) {
     return new Map(docs.map((d) => [d._id.toString(), d]));
 }
 
-/** A reply the engine found in the operator's inbox. The provider message id
- *  (e.g. Gmail's) makes re-recording the same reply a no-op. */
+async function getThread(db: Db, id: string) {
+    return (await getEmailThreads(db)).find((t) => t.id === id);
+}
+
+/** A reply found in the operator's inbox. The Gmail message id makes
+ *  re-recording a no-op; the RFC Message-ID header lets our answer thread. */
 export async function recordReply(
     db: Db,
     id: string,
-    reply: { content?: unknown; receivedAt?: unknown; sentiment?: unknown; providerMessageId?: unknown }
+    reply: {
+        content?: unknown;
+        receivedAt?: unknown;
+        sentiment?: unknown;
+        providerMessageId?: unknown;
+        internetMessageId?: unknown;
+    }
 ) {
     if (typeof reply.content !== "string" || !reply.content.trim()) {
         return { recorded: false, reason: "content is required" };
     }
-    return recordInboundMessage(db, {
+    const result = await recordInboundMessage(db, {
         channel: "email",
         leadId: id,
         content: reply.content,
@@ -326,44 +394,116 @@ export async function recordReply(
         sentiment: typeof reply.sentiment === "string" ? (reply.sentiment as Sentiment) : undefined,
         providerMessageId: typeof reply.providerMessageId === "string" ? reply.providerMessageId : undefined,
     });
+    const messageId = typeof reply.internetMessageId === "string" ? asMessageId(reply.internetMessageId.trim()) : undefined;
+    if (result.recorded && messageId && typeof reply.providerMessageId === "string") {
+        await db
+            .collection("messages")
+            .updateOne({ providerMessageId: reply.providerMessageId }, { $set: { internetMessageId: messageId } });
+    }
+    return result;
 }
 
-/**
- * Sends one follow-up email, but only when it is genuinely due: the lead was
- * emailed, hasn't replied or opted out, the wait since the last email has
- * passed, and the follow-up limit isn't reached. These checks live here, not
- * in the engine's instructions, so no prompt mistake can over-send.
- */
+function refusal(thread: Awaited<ReturnType<typeof getThread>>, kind: string): string {
+    if (!thread) return "This lead has not been emailed yet.";
+    if (thread.optedOut) return "Not sent: the lead has opted out.";
+    return `Not sent: no ${kind} is due for this lead right now.`;
+}
+
+async function sendInThread(db: Db, id: string, content: string, replyToMessageId?: string) {
+    const lead = await getLead(db, id);
+    if (!lead) return { ok: false, message: "Lead not found" };
+    return sendMessage(db, lead, "email", content, { inReplyTo: replyToMessageId });
+}
+
+/** One follow-up to a lead who hasn't replied, only when it's due. */
 export async function sendFollowUp(db: Db, id: string, content: unknown) {
-    if (typeof content !== "string" || !content.trim()) {
-        return { ok: false, message: "content is required" };
-    }
-    const thread = (await getEmailThreads(db)).find((t) => t.id === id);
-    if (!thread) return { ok: false, message: "This lead has not been emailed yet." };
-    if (!thread.followUpDue) {
+    if (typeof content !== "string" || !content.trim()) return { ok: false, message: "content is required" };
+    const thread = await getThread(db, id);
+    if (!thread?.followUpDue) {
         return {
             ok: false,
-            message: thread.replied
-                ? "Not sent: the lead has already replied."
-                : thread.optedOut
-                    ? "Not sent: the lead has opted out."
-                    : thread.followUpsSent >= FOLLOW_UP_DELAYS_DAYS.length
-                        ? "Not sent: the follow-up limit is reached."
-                        : `Not sent: next follow-up is due ${FOLLOW_UP_DELAYS_DAYS[thread.followUpsSent]} days after the last email (it has been ${thread.daysSinceLastEmail}).`,
+            message:
+                thread?.replied
+                    ? "Not sent: the lead has replied, so answer them with send-reply instead."
+                    : thread && thread.followUpsSent >= MAX_FOLLOW_UPS
+                        ? "Not sent: all follow-ups are used; retire this lead."
+                        : thread && !thread.optedOut
+                            ? `Not sent: follow-ups go every ${FOLLOW_UP_EVERY_DAYS} days (it has been ${thread.daysSinceLastMessage}).`
+                            : refusal(thread, "follow-up"),
         };
     }
+    return sendInThread(db, id, content.trim(), thread.replyToMessageId);
+}
 
+/** An answer in an ongoing conversation: when the lead's reply is waiting,
+ *  or as a gentle nudge when they've gone quiet after our answer. */
+export async function sendConversationReply(db: Db, id: string, content: unknown) {
+    if (typeof content !== "string" || !content.trim()) return { ok: false, message: "content is required" };
+    const thread = await getThread(db, id);
+    if (!thread || !(thread.needsReply || thread.nudgeDue)) return { ok: false, message: refusal(thread, "reply") };
+    return sendInThread(db, id, content.trim(), thread.replyToMessageId);
+}
+
+/** A meeting the lead booked (seen as a calendar confirmation in the inbox). */
+export async function recordMeeting(
+    db: Db,
+    id: string,
+    meeting: { scheduledAt?: unknown; notes?: unknown }
+) {
+    const when = new Date(String(meeting.scheduledAt || ""));
+    if (Number.isNaN(when.getTime())) return { ok: false, message: "A valid scheduledAt (ISO date) is required" };
     const lead = await getLead(db, id);
     if (!lead) return { ok: false, message: "Lead not found" };
 
-    const result = await sendMessage(db, lead, "email", content.trim(), {
-        inReplyTo: thread.threadMessageId,
+    const existing = await db
+        .collection("appointments")
+        .findOne({ leadId: id, scheduledAt: when.toISOString(), status: "Scheduled" });
+    if (existing) return { ok: true, message: "Meeting already recorded." };
+
+    await db.collection("appointments").insertOne({
+        leadId: id,
+        companyName: lead.companyName,
+        scheduledAt: when.toISOString(),
+        serviceInterest: typeof meeting.notes === "string" ? meeting.notes.slice(0, 500) : "",
+        budget: "",
+        timeline: "",
+        status: "Scheduled",
+        source: "engine",
+        createdAt: new Date().toISOString(),
     });
-    if (result.ok) {
-        await db.collection("leads").updateOne(
-            { _id: lead._id },
-            { $set: { lastFollowUpAt: new Date().toISOString() }, $inc: { followUpCount: 1 } }
-        );
+    if (["New", "Analyzing", "Analyzed", "Contacted", "Replied"].includes(lead.status)) {
+        await db.collection("leads").updateOne({ _id: lead._id }, { $set: { status: "Qualified" } });
     }
-    return result;
+    await logActivity(db, id, "appointment_booked", `Meeting booked for ${when.toISOString()}`);
+    return { ok: true, message: `Meeting recorded for ${when.toISOString()}.` };
+}
+
+/**
+ * Removes a lead that never replied after every follow-up, as the operator
+ * asked. Its name and email go on a retired list first, so discovery and
+ * imports never add it (and contact it) again.
+ */
+export async function retireLead(db: Db, id: string) {
+    const thread = await getThread(db, id);
+    if (!thread?.retireDue) {
+        return { ok: false, message: "Not retired: this lead isn't due for removal (it replied, or follow-ups aren't finished)." };
+    }
+    const lead = await getLead(db, id);
+    if (!lead) return { ok: false, message: "Lead not found" };
+
+    await db.collection("retiredLeads").insertOne({
+        dedupeKey: lead.dedupeKey || null,
+        email: (lead.email || "").toLowerCase() || null,
+        website: lead.website || null,
+        companyName: lead.companyName,
+        reason: `No reply after ${MAX_FOLLOW_UPS} follow-ups`,
+        retiredAt: new Date().toISOString(),
+    });
+    await Promise.all([
+        db.collection("messages").deleteMany({ leadId: id }),
+        db.collection("activities").deleteMany({ leadId: id }),
+        db.collection("notes").deleteMany({ leadId: id }),
+        db.collection("leads").deleteOne({ _id: lead._id }),
+    ]);
+    return { ok: true, message: `${lead.companyName} removed after ${MAX_FOLLOW_UPS} unanswered follow-ups.` };
 }

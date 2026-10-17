@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/db";
 import { authorizeEngine } from "@/lib/engine";
-
-const DEFAULT_DAILY_TARGET = 25;
+import { getDailyPlan, planDayStart, splitAcross } from "@/lib/daily-plan";
 
 /**
- * Where the engine stands before a run: which campaigns to find leads for,
- * each one's daily target and how many it already got today (targets are per
- * day, not per run), and how much pipeline work is waiting.
+ * Where the engine stands before a run: today's lead target (set by the
+ * operator from the dashboard prompt, split evenly across the active
+ * campaigns), how many each campaign already got today, and how much
+ * pipeline work is waiting. "Today" is the Pakistan day.
  */
 export async function GET(request: Request) {
     if (!authorizeEngine(request)) {
@@ -15,18 +15,22 @@ export async function GET(request: Request) {
     }
     try {
         const db = await getDb();
-        const startOfDay = new Date();
-        startOfDay.setUTCHours(0, 0, 0, 0);
+        const dayStart = planDayStart().toISOString();
 
-        const [campaigns, addedToday, waiting, lastRun] = await Promise.all([
+        const [plan, campaigns, perCampaignToday, waiting, lastRun] = await Promise.all([
+            getDailyPlan(db),
             db
                 .collection("campaigns")
-                .find({ status: "Active" }, { projection: { name: 1, niche: 1, country: 1, locations: 1, leadCountPerRun: 1 } })
+                .find({ status: "Active" }, { projection: { name: 1, niche: 1, country: 1, locations: 1 } })
+                .sort({ _id: 1 })
                 .toArray(),
-            db.collection("leads").countDocuments({
-                discoveredBy: "claude_search",
-                createdAt: { $gte: startOfDay.toISOString() },
-            }),
+            db
+                .collection("leads")
+                .aggregate<{ _id: string; count: number }>([
+                    { $match: { discoveredBy: "claude_search", createdAt: { $gte: dayStart } } },
+                    { $group: { _id: "$campaignId", count: { $sum: 1 } } },
+                ])
+                .toArray(),
             db.collection("leads").countDocuments({
                 optedOut: { $ne: true },
                 activityVerdict: { $ne: "inactive" },
@@ -36,22 +40,19 @@ export async function GET(request: Request) {
             db.collection("engine_runs").find().sort({ ranAt: -1 }).limit(1).next(),
         ]);
 
-        // Each campaign has its own daily target (its leadCountPerRun), so one
-        // campaign running dry never eats into another's quota.
-        const perCampaignToday = await db
-            .collection("leads")
-            .aggregate<{ _id: string; count: number }>([
-                { $match: { discoveredBy: "claude_search", createdAt: { $gte: startOfDay.toISOString() } } },
-                { $group: { _id: "$campaignId", count: { $sum: 1 } } },
-            ])
-            .toArray();
         const addedByCampaign = new Map(perCampaignToday.map((row) => [String(row._id), row.count]));
+        const split = splitAcross(plan.effectiveTotal, campaigns.length);
 
         return NextResponse.json({
-            campaigns: campaigns.map((c) => {
+            today: {
+                date: plan.date,
+                totalLeads: plan.effectiveTotal,
+                setByOperator: plan.todayTotal !== null,
+            },
+            campaigns: campaigns.map((c, i) => {
                 const id = c._id.toString();
-                const dailyTarget = Number(c.leadCountPerRun) || DEFAULT_DAILY_TARGET;
-                const addedTodayForCampaign = addedByCampaign.get(id) || 0;
+                const dailyTarget = split[i];
+                const addedToday = addedByCampaign.get(id) || 0;
                 return {
                     id,
                     name: c.name,
@@ -59,11 +60,11 @@ export async function GET(request: Request) {
                     country: c.country,
                     locations: c.locations || [],
                     dailyTarget,
-                    addedToday: addedTodayForCampaign,
-                    remainingToday: Math.max(0, dailyTarget - addedTodayForCampaign),
+                    addedToday,
+                    remainingToday: Math.max(0, dailyTarget - addedToday),
                 };
             }),
-            leadsAddedToday: addedToday,
+            leadsAddedToday: perCampaignToday.reduce((sum, row) => sum + row.count, 0),
             leadsWaitingForWork: waiting,
             lastRun: lastRun ? { summary: lastRun.summary, ranAt: lastRun.ranAt } : null,
         });

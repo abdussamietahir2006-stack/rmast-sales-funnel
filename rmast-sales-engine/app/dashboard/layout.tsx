@@ -1,5 +1,6 @@
 "use client";
 import CopilotWidget from "@/components/CopilotWidget";
+import DailyLeadsPrompt from "@/components/DailyLeadsPrompt";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -77,6 +78,8 @@ export default function DashboardLayout({
                         <p className="text-[10px] uppercase font-bold tracking-widest text-emerald-500/80">Luxury Sales Engine</p>
                     </div>
                 </div>
+
+                <DailyLeadsPrompt />
 
                 <nav className="space-y-1">
                     {navItems.map((item) => {

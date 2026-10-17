@@ -1,6 +1,6 @@
 ---
 name: run-sales-engine
-description: Run the RMAST sales funnel with Claude as the AI - check the Gmail inbox for replies and send due email follow-ups, find each active campaign's daily quota of new leads (small struggling brokerages and solo realtors) with web search, verify each is actively operating and research its owner, then write the activity check, analysis, enrichment, competitors, full business audit, five-page demo site and outreach drafts. Use when asked to run the sales engine, get or process leads, or for the daily scheduled run. Never sends messages; the operator clicks Send.
+description: Run the RMAST sales funnel with Claude as the AI. Inbox mode - read replies in rmaststudio@gmail.com, answer leads who replied and book meetings, send due follow-ups (every 3 days, max 4) and remove leads that never replied. Leads mode - find today's lead target (set by the operator, split across active campaigns) of small struggling brokerages and solo realtors, verify each is active, research owner and all three socials, then write audit, five-page demo and outreach drafts. Use for the scheduled runs or when asked to run the sales engine, check replies, or get leads. First contact is always the operator's.
 ---
 
 # Run the sales engine
@@ -9,18 +9,33 @@ You are the AI for the RMAST STUDIO sales engine (`rmast-sales-engine/`). The
 app stores, validates and renders everything; you do the research and the
 writing. All commands below run from `rmast-sales-engine/`.
 
-**The only thing you ever send is an email follow-up** (step 1b), to a lead
-the operator already emailed. First contact on every channel is the
-operator's: you draft it, they review it in the dashboard and click Send.
-Never send anything on LinkedIn, Instagram, Facebook or WhatsApp, and never
-change the Auto-Send setting.
+## What you may and may not send
 
-**What matters most, in order:**
+- **First contact is always the operator's.** You only draft it; they review
+  it in the dashboard and click Send. Never send a first message to anyone.
+- **After that, email is yours:** follow-ups to leads who haven't replied,
+  and the whole conversation with leads who did, until a meeting is booked.
+  The operator takes the meeting.
+- Never send anything on LinkedIn, Instagram, Facebook or WhatsApp (those are
+  manual), and never change the Auto-Send setting.
+- The app enforces these limits itself and refuses anything not allowed
+  (`409`). A refusal means skip it, never work around it.
+
+## What matters most in research, in order
+
 1. **The business is actively operating right now.** No lead is better than a
-   dead one. Verify before you add it.
-2. **The owner's details:** name, title, their own LinkedIn, and their direct
-   business email and phone where publicly listed.
-3. Complete, accurate contact and social details for the business.
+   dead one.
+2. **The owner's details:** name, title, personal LinkedIn, direct business
+   email and phone where publicly listed.
+3. **All three socials, searched for every lead:** LinkedIn, Instagram,
+   Facebook (step 4.2). A business with none of them is not added.
+
+## Modes
+
+- **Inbox mode** (the pre-9 PM run, or "check replies"): steps 0 and 1.
+- **Leads mode** (the 9 PM run, or "get leads"): steps 0, 2, 3, 4 and 5,
+  within a **60-minute budget** (see "Time budget").
+- Asked to "run the sales engine" without a mode: do both, inbox first.
 
 ## 0. Make sure the engine can reach the app
 
@@ -28,53 +43,104 @@ change the Auto-Send setting.
 node scripts/engine.mjs status
 ```
 
-`scripts/engine.mjs` talks to `ENGINE_URL` from `.env.local` (the deployed
-Vercel app), or `http://localhost:3000` if that isn't set. If it can't connect
-and `ENGINE_URL` is not set, start the local app in the background with
-`npm run dev` and retry. If the database is unreachable, stop and report it.
+`scripts/engine.mjs` talks to `ENGINE_URL` in `.env.local` (the deployed
+Vercel app). If it can't connect, stop and report it.
 
-## 1. Email: record replies, send follow-ups
+**Never point the engine or any test at the local app with real lead data:**
+the local `.env.local` has live Gmail credentials, so local sends are real.
 
-Do this first each run. Email is the engine's job after the operator sends
-the first message; LinkedIn, Instagram, Facebook and WhatsApp are always
-manual, so never act on those.
+## 1. Inbox: replies, conversations, meetings, follow-ups
 
 ```bash
 node scripts/engine.mjs email
 ```
 
-This lists every emailed lead (`threads`): `email`, `ownerName`,
-`originalSubject`, `emailsSent` (dates and full text), `replied`,
-`followUpsSent`, `daysSinceLastEmail` and **`followUpDue`**. `replyTo` is the
-inbox replies go to: the operator's Gmail, **rmaststudio@gmail.com**, which
-also sends the emails (they appear in its Sent folder).
+Returns `rules` (follow-up every 3 days, max 4, retire 3 days after the last),
+`replyTo` (the inbox, **rmaststudio@gmail.com**, which also sends all email),
+`bookingUrl` (the operator's calendar booking link), and `threads`: every
+emailed lead with `ownerName`, `email`, `location`, `originalSubject`, the full
+`messages` list, `meetingBookedFor`, and which step is due: **`needsReply`**,
+**`followUpDue`** (with `followUpsSent`), **`nudgeDue`**, **`retireDue`**.
 
-**a. Check the inbox for replies.** Use the Gmail connector on the `replyTo`
-inbox. For each thread with `replied: false`, search for messages from that
-lead's address since its first email (e.g. `from:owner@agency.com
-after:2026/10/17`). For each reply found, record it with the Gmail message id
-so it is never recorded twice:
+**If the Gmail connector is unavailable, stop here: record nothing and send
+nothing** (you can't know who replied). Report it.
+
+### a. Read the inbox and record what arrived
+
+Use the Gmail connector on rmaststudio@gmail.com. Search for messages from
+each thread's `email` since its first message, and for calendar booking
+confirmations. For each **reply** from a lead, record it once:
 
 ```bash
 node scripts/engine.mjs reply <leadId> <reply.json>
 ```
 ```json
-{ "content": "the reply text, without the quoted original", "receivedAt": "ISO date",
-  "sentiment": "Positive | Neutral | Negative | Not Interested", "providerMessageId": "gmail message id" }
+{ "content": "their reply only, without the quoted thread", "receivedAt": "ISO date",
+  "sentiment": "Positive | Neutral | Negative | Not Interested",
+  "providerMessageId": "Gmail message id", "internetMessageId": "<the Message-ID header>" }
 ```
 
-Sentiment: **Positive** = interested, asks questions, wants a call; **Neutral**
-= acknowledgement or unclear; **Negative** = annoyed; **Not Interested** = a
-clear no or "stop emailing" (the app then opts them out automatically). Do
-not reply to anyone yourself; list Positive replies in the run summary so the
-operator follows up personally. Also treat an out-of-office auto-reply as no
-reply (don't record it).
+- Sentiment: **Positive** = interested or asking questions; **Neutral** =
+  unclear; **Negative** = annoyed; **Not Interested** = a clear no or "stop"
+  (the app opts them out; never email them again).
+- `internetMessageId` is the email's `Message-ID` header; it makes your
+  answer thread under their reply. Include it whenever Gmail shows it.
+- Ignore out-of-office auto-replies.
+- **Bounces** ("Delivery Status Notification", mailer-daemon) for a lead's
+  address: don't record them as replies; list them in the summary so the
+  operator can fix the address.
+- **Booking confirmations** (Google Calendar "booked" / "invitation"
+  emails naming a lead or their email): record the meeting, using the
+  meeting's start time in UTC:
 
-**If the Gmail connector is not available, record nothing and send NO
-follow-ups this run** (you can't know who replied). Say so in the summary.
+  ```bash
+  node scripts/engine.mjs meeting <leadId> <meeting.json>
+  ```
+  ```json
+  { "scheduledAt": "2026-10-21T16:00:00Z", "notes": "what they want to discuss" }
+  ```
 
-**b. Send due follow-ups.** For each thread with `followUpDue: true` (only
-after step a), write a follow-up and send it:
+Run `email` again afterwards so `needsReply` reflects what you recorded.
+
+### b. Answer leads who replied (`needsReply`), and work to a meeting
+
+Read the whole `messages` thread, then send one reply:
+
+```bash
+node scripts/engine.mjs send-reply <leadId> <reply.json>
+```
+```json
+{ "content": "Subject: Re: <originalSubject>\n\nHi <first name>,\n\n...\n\nBest,\nRMAST STUDIO" }
+```
+
+- Goal: a booked call. Answer what they asked, briefly and honestly, then
+  invite them to pick a time with the booking link.
+- **Meeting times: prefer 8 PM to 12 AM Pakistan time (UTC+5).** Convert for
+  them: California (Pacific) and Texas (Central) both run on daylight time
+  until the first Sunday of November and standard time after it. In
+  daylight time that's 8 AM-12 PM Pacific / 10 AM-2 PM Central; in standard
+  time, 7-11 AM Pacific / 9 AM-1 PM Central. Suggest two or three of those
+  slots in **their** time zone alongside the link. Offer a Pakistan-morning
+  slot only if they say none of those work.
+- If `bookingUrl` is set, always include it on its own line. If it isn't, ask
+  them to reply with the slot that suits them, then when they confirm a
+  specific time, record it with `meeting` and confirm it back to them.
+- Never promise prices, timelines, discounts or contract terms; say they'll
+  be covered on the call. Only RMAST's five services. Keep it short (3-6
+  sentences), warm and specific to their business.
+- A clear "not interested": record the sentiment and don't answer.
+- A question you can't answer honestly from their audit and RMAST's services:
+  say you'll cover it on the call.
+- `meetingBookedFor` set and they write again (e.g. to reschedule): answer
+  helpfully, send the booking link to rebook, and record any new time.
+
+### c. Nudge quiet conversations (`nudgeDue`)
+
+They replied earlier, you answered, and they went quiet for 3+ days: send one
+short, friendly nudge with `send-reply` (1-2 sentences, booking link again).
+At most two nudges; the app stops you after that.
+
+### d. Follow up with leads who never replied (`followUpDue`)
 
 ```bash
 node scripts/engine.mjs follow-up <leadId> <followup.json>
@@ -83,33 +149,72 @@ node scripts/engine.mjs follow-up <leadId> <followup.json>
 { "content": "Subject: Re: <originalSubject>\n\nHi <first name>,\n\n..." }
 ```
 
-- First follow-up (`followUpsSent: 0`): 2-3 sentences. A light nudge that adds
-  one new, specific point from their audit (a different finding than the first
-  email), and repeats the offer to look at their report and demo.
-- Second follow-up (`followUpsSent: 1`): 1-2 sentences, a polite last note
-  ("I'll leave it here, the report and demo stay up if useful").
-- Copy the `Growth Report:` and `Live Demo:` link lines exactly from the first
-  email in `emailsSent` and put them at the end. Never invent or alter a link.
-- Same tone rules as outreach: friendly, specific, no pressure, no filler,
-  only RMAST's five services. Write as RMAST STUDIO.
+One follow-up every 3 days, four in total, each different:
 
-The app refuses any follow-up that isn't due (already replied, opted out, too
-soon, or past the 2 follow-up limit), so a refusal just means skip it.
+1. (`followUpsSent: 0`) A light nudge with one new specific finding from their audit.
+2. (`1`) A different angle: one quick win they could do this week, from their audit.
+3. (`2`) Short social proof of the idea, e.g. what a refreshed site or
+   consistent posting does for a small brokerage (no invented statistics).
+4. (`3`) A polite last note: "I'll close this out; the report and demo stay up."
 
-## 2. Read the status
+Each is 2-3 sentences (the last 1-2), ends with the `Growth Report:` and
+`Live Demo:` link lines copied **exactly** from the first message in the
+thread, and follows the outreach tone rules. Never invent or alter a link.
 
-- `campaigns`: active campaigns, each with `niche`, `country`, `locations`,
-  `dailyTarget`, `addedToday` and **`remainingToday`**, which is how many new
-  leads to add for that campaign in this run (0 means it is done for today).
-  Each campaign has its own quota; never shift one campaign's quota to another.
-- `leadsWaitingForWork`: leads still needing pipeline work from earlier runs.
+### e. Remove leads that never replied (`retireDue`)
+
+```bash
+node scripts/engine.mjs retire <leadId>
+```
+
+This deletes the lead after its 4th follow-up went unanswered for 3 days,
+and remembers the business so it is never added again.
+
+### f. Summary (inbox mode)
+
+Replies recorded (name each, with sentiment), conversations answered,
+meetings booked (lead, time in Pakistan time), follow-ups sent, nudges sent,
+leads removed, bounces, and anything that failed.
+
+## 2. Read the status (leads mode)
+
+- `today.totalLeads`: how many new leads to find today, set by the operator
+  in the dashboard's daily prompt (`setByOperator: false` means they didn't
+  set it today and the last number is reused).
+- `campaigns`: each active campaign with its share of that total
+  (`dailyTarget`), `addedToday` and **`remainingToday`**, how many to add for
+  it now. Never shift one campaign's share to another.
+- `leadsWaitingForWork`: leads still needing processing from earlier runs;
+  finish those as part of this run.
+
+## Time budget (leads mode): 60 minutes, in parallel
+
+The whole leads run must finish within **60 minutes** of starting. Use
+parallel workers with the Agent tool rather than doing everything yourself
+in sequence:
+
+1. **Minute 0-20, discovery:** one worker per campaign, at the same time.
+   Give each the campaign's id, name, locations and `remainingToday`, and the
+   full text of steps 3 and 4.2 below. Each adds its leads with `add-leads`
+   and returns how many it added.
+2. **Minute 15-55, processing:** as leads arrive, split the `queue` into
+   batches of about 5 and run up to 5 workers at once. Give each worker its
+   lead ids and the full text of step 4 and "Section schemas and rules"
+   below. Each submits every lead and returns what passed or failed.
+3. **Minute 55:** start nothing new; let running workers finish their current
+   lead. Anything unfinished stays queued for tomorrow.
+4. Log the run (step 5).
+
+Workers must follow the same rules as you; paste them the relevant sections
+verbatim rather than summarising. If the Agent tool isn't available, do the
+same work yourself in order, keeping the 60-minute limit.
 
 ## 3. Find new leads
 
 ### Who to target
 
 For each campaign with `remainingToday > 0`, find real-estate businesses in
-its `country` and `locations` (for example California or Texas), mixing:
+its `country` and `locations`, mixing:
 
 - **Solo realtors** and small teams (1-5 agents) working under their own name
   or a small brand.
@@ -117,56 +222,53 @@ its `country` and `locations` (for example California or Texas), mixing:
   listings, an outdated or missing website, little or stale social activity,
   few reviews. These benefit most from RMAST's services.
 
-Skip big franchises' corporate pages, national portals, and large brokerages.
-An agent at a big franchise office counts only if they run their own brand
-and website.
+Skip big franchises' corporate pages, national portals and large brokerages
+(dozens of agents, hundreds of reviews). An agent at a big franchise counts
+only if they run their own brand and website.
 
-Spread searches across many cities in the state (e.g. California: Los
-Angeles, San Diego, Sacramento, Fresno, San Jose, Riverside, Bakersfield,
-Santa Rosa...; Texas: Houston, Dallas, Austin, San Antonio, Fort Worth, El
-Paso, Plano, Corpus Christi...). Useful sources: Google and Maps results,
-Zillow and Realtor.com agent directories, Yelp, LinkedIn, Instagram, and the
-state license lookups below.
+Spread searches across many cities in the state. Useful sources: Google and
+Maps, Zillow and Realtor.com agent directories, Yelp, LinkedIn, Instagram,
+Facebook, and the state license lookups below.
 
-### The active-status gate (required before adding)
+### Gates (all required before adding)
 
-Only add a business when you found **recent evidence it is operating**,
-ideally from two of these, at least one from the last 90 days:
+1. **Active:** recent evidence it's operating, ideally two of these, one from
+   the last 90 days:
+   - A current **real-estate license**: California DRE
+     (https://www2.dre.ca.gov/publicasp/pplinfo.asp) or Texas TREC
+     (https://www.trec.texas.gov/apps/license-holder-search/). The strongest
+     single signal. The DRE form can be searched by POSTing
+     `h_nextstep=SEARCH&LICENSEE_NAME=<last name>` to `pplinfo.asp?start=1`,
+     then opening `pplinfo.asp?License_id=<id>`.
+   - Recent Instagram, Facebook or LinkedIn posts.
+   - Current listings or recent sales on Zillow, Realtor.com or their site.
+   - Recent Google, Zillow or Yelp reviews.
 
-- A current, active **real-estate license** in the state lookup: California
-  DRE (https://www2.dre.ca.gov/publicasp/pplinfo.asp) or Texas TREC
-  (https://www.trec.texas.gov/apps/license-holder-search/). This is the
-  strongest single signal.
-- Recent Instagram, Facebook or LinkedIn posts by the realtor or brokerage.
-- Current listings or recent sales on Zillow, Realtor.com or their own site.
-- Recent Google, Zillow or Yelp reviews.
-
-Skip anyone with an expired or cancelled license, social accounts silent for
-over a year, no current listings, or closure signs. Note the evidence you
-found; you'll need it for the `activity` section.
+   Skip expired or cancelled licenses, socials silent for over a year, no
+   current listings, or closure signs.
+2. **Reachable by email:** a public email for the business or owner. The
+   operator's first contact is email.
+3. **On social media:** at least one of LinkedIn (company page or the owner's
+   profile), Instagram or Facebook, found with the search in step 4.2.
+   Prefer businesses with two or three. A business with none is not added.
 
 ### Adding them
 
-For each business that passes the gate, record what you actually found:
-
 ```json
 [{ "companyName": "Business or realtor brand name", "niche": "Real Estate", "market": "USA",
-   "location": "City, State", "website": "https://...", "phone": "+1...", "email": "" }]
+   "location": "City, State", "website": "https://...", "phone": "+1...", "email": "..." }]
 ```
 
-- `companyName` and `market` are required; `niche` and `market` match the campaign.
-- Never invent names, sites, phones or emails. Leave a field `""` if not found.
-
-Write the list to a JSON file outside the repo (your scratchpad or temp
-dir) and add it **with that campaign's id**:
+`companyName` and `market` are required; never invent anything. Write the
+list to a JSON file outside the repo and add it **with that campaign's id**:
 
 ```bash
 node scripts/engine.mjs add-leads <file.json> <campaignId>
 ```
 
-Duplicates are skipped automatically and don't count toward the quota.
-Re-check `node scripts/engine.mjs status` and keep going until each campaign's `remainingToday` is 0,
-or searches genuinely stop turning up new active businesses.
+Duplicates, removed leads and unsubscribed addresses are skipped
+automatically and don't count. Re-check `status` until each campaign's
+`remainingToday` is 0 or the time budget says stop.
 
 ## 4. Research and process each lead
 
@@ -174,27 +276,32 @@ or searches genuinely stop turning up new active businesses.
 node scripts/engine.mjs queue 10
 ```
 
-For each lead (repeat `queue` until it is empty):
+For each lead:
 
-1. `node scripts/engine.mjs context <id>` gives the stored lead, `missing`
-   (the steps still needed), `website.homepageText` (a fresh scrape),
-   `website.note`, `brand` (their logo, photos and colors, used by the demo
-   automatically) and `auditAreas`.
+1. `node scripts/engine.mjs context <id>` gives the stored lead, `missing`,
+   `website.homepageText`, `website.note`, `brand` (their logo, photos and
+   colors, used by the demo automatically) and `auditAreas`.
 2. **Research thoroughly**, in this order:
-   - **Owner:** who owns or runs it (for a solo realtor, the realtor). Find
-     their full name, title (e.g. Broker/Owner, Realtor), their personal
-     LinkedIn profile (linkedin.com/in/...), and their direct business email
-     and phone if publicly listed on their site, license record, or profiles.
-   - **License:** look them up in the CA DRE or TX TREC lookup and record the
-     license number and status.
-   - **Active status:** confirm the evidence from step 2 and look for more:
-     date of the latest Instagram/LinkedIn post, current listings, latest
-     reviews.
-   - **Business contacts and socials:** website, office phone, email,
-     Instagram, Facebook, LinkedIn company page.
+   - **Owner:** who owns or runs it. Full name, title (e.g. Broker/Owner),
+     personal LinkedIn (linkedin.com/in/...), and direct business email and
+     phone if public on their site, license record or profiles.
+   - **License:** CA DRE or TX TREC number and status.
+   - **Active status:** dates of the latest posts, current listings, latest reviews.
+   - **Socials, each platform separately (required for every lead):**
+     1. Links on every page of their website (header, footer, contact, about).
+     2. Links on their Zillow, Realtor.com, Google Business and Yelp profiles.
+     3. A site-restricted search per platform, by business name and by
+        owner name with the city: `site:linkedin.com/in "<owner>" <city>
+        realtor`, `site:linkedin.com/company "<business>"`,
+        `site:instagram.com "<business or owner>" realtor`,
+        `site:facebook.com "<business>" <city>`.
+     Record every real profile you confirm belongs to this business or owner
+     (name, location or listings match). Never guess a handle; Instagram and
+     Facebook show a login page for any address, so a URL "working" proves
+     nothing. If a platform genuinely has nothing after all three methods,
+     leave it empty and say so in the audit's social findings.
    - **Their situation:** listing count, reviews, website quality, social
      activity, and 1-2 real local competitors doing better.
-   Fetch other pages of their site (About, Team, Contact) when the homepage is thin.
 3. Write one JSON file with **every section listed in `missing`** (schemas
    below) and submit it:
 
@@ -206,14 +313,13 @@ For each lead (repeat `queue` until it is empty):
    Fix and resubmit any failed section. If `stoppedReason` says the lead looks
    inactive, move on.
 
-Do leads one at a time and submit each before starting the next, so a run
-that stops early keeps everything finished. If usage is running short, stop
-after the current lead; the rest stay queued for the next run.
+Submit each lead before starting the next, so a run that stops early keeps
+everything finished.
 
 ## 5. Log the run
 
 ```bash
-node scripts/engine.mjs log-run "Email: R replies recorded (P positive: names), F follow-ups sent. California: added N (M processed). Texas: added N (M processed). Skipped K inactive. X still queued."
+node scripts/engine.mjs log-run "Leads: California added N (M processed), Texas added N (M processed), K skipped, X still queued. Time: NN min."
 ```
 
 Then report the same summary.
@@ -362,6 +468,7 @@ logo and photos.
 
 One message per channel, from RMAST STUDIO:
 
+- The `email` draft starts with its own subject line: `Subject: <specific, under 8 words>` then a blank line, e.g. `Subject: A few quick wins for Matel Realtors' website`.
 - Address the owner by first name when you found it ("Hi Maria,").
 - 2-4 sentences, friendly, low-pressure, suited to the channel (email may open
   with a greeting; WhatsApp and DMs are shorter and more casual).

@@ -12,6 +12,9 @@
  *   node scripts/engine.mjs email
  *   node scripts/engine.mjs reply <leadId> <reply.json>
  *   node scripts/engine.mjs follow-up <leadId> <followup.json>
+ *   node scripts/engine.mjs send-reply <leadId> <reply.json>
+ *   node scripts/engine.mjs meeting <leadId> <meeting.json>
+ *   node scripts/engine.mjs retire <leadId>
  *   node scripts/engine.mjs log-run "<summary>"
  */
 import { readFileSync, existsSync } from "node:fs";
@@ -97,9 +100,12 @@ switch (command) {
         }));
         break;
     }
-    case "email":
-        print(await call("GET", "/api/engine/email"));
+    case "email": {
+        // The booking link lives in .env.local (BOOKING_URL), next to ENGINE_URL.
+        const data = await call("GET", "/api/engine/email");
+        print({ bookingUrl: env.BOOKING_URL || null, ...data });
         break;
+    }
     case "reply":
         if (!args[0] || !args[1]) throw new Error("usage: reply <leadId> <reply.json>");
         print(await call("POST", `/api/engine/leads/${args[0]}/reply`, readJson(args[1])));
@@ -108,11 +114,23 @@ switch (command) {
         if (!args[0] || !args[1]) throw new Error("usage: follow-up <leadId> <followup.json>");
         print(await call("POST", `/api/engine/leads/${args[0]}/follow-up`, readJson(args[1])));
         break;
+    case "send-reply":
+        if (!args[0] || !args[1]) throw new Error("usage: send-reply <leadId> <reply.json>");
+        print(await call("POST", `/api/engine/leads/${args[0]}/send-reply`, readJson(args[1])));
+        break;
+    case "meeting":
+        if (!args[0] || !args[1]) throw new Error("usage: meeting <leadId> <meeting.json>");
+        print(await call("POST", `/api/engine/leads/${args[0]}/meeting`, readJson(args[1])));
+        break;
+    case "retire":
+        if (!args[0]) throw new Error("usage: retire <leadId>");
+        print(await call("POST", `/api/engine/leads/${args[0]}/retire`, {}));
+        break;
     case "log-run":
         if (!args[0]) throw new Error('usage: log-run "<summary>"');
         print(await call("POST", "/api/engine/runs", { summary: args.join(" ") }));
         break;
     default:
-        console.error("Commands: status | queue [limit] | context <id> | submit <id> <file> | add-leads <file> [campaignId] | email | reply <id> <file> | follow-up <id> <file> | log-run <summary>");
+        console.error("Commands: status | queue [limit] | context <id> | submit <id> <file> | add-leads <file> [campaignId] | email | reply <id> <file> | follow-up <id> <file> | send-reply <id> <file> | meeting <id> <file> | retire <id> | log-run <summary>");
         process.exit(1);
 }
