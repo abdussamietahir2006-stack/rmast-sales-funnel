@@ -444,6 +444,8 @@ export interface EnrichmentFindings {
     ownerLinkedin?: string;
     licenseInfo?: string;
     phone?: string;
+    /** A mobile number the business or owner uses on WhatsApp, when found. */
+    whatsapp?: string;
     instagram?: string;
     facebook?: string;
     linkedin?: string;
@@ -476,6 +478,7 @@ export async function applyEnrichment(
     const email: string = lead.email || foundEmail;
     const ownerName: string = lead.ownerName || (typeof found.ownerName === "string" ? found.ownerName.trim() : "");
     const phone: string = lead.phone || (typeof found.phone === "string" ? found.phone.trim() : "");
+    const whatsapp: string = lead.whatsapp || (typeof found.whatsapp === "string" ? found.whatsapp.trim().slice(0, 40) : "");
     const contactSource: string =
         lead.email ? lead.contactSource || "google_places" : foundEmail ? "website" : lead.contactSource || "google_places";
 
@@ -504,6 +507,7 @@ export async function applyEnrichment(
         email,
         ownerName,
         ownerTitle,
+        whatsapp,
         ownerLinkedin,
         licenseInfo,
         phone,

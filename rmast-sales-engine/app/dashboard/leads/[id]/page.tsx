@@ -44,6 +44,7 @@ interface Lead {
     ownerTitle?: string;
     ownerLinkedin?: string;
     licenseInfo?: string;
+    whatsapp?: string;
     contactMethod?: string;
     status: string;
     activityScore?: number;
@@ -95,6 +96,52 @@ const CHANNELS = [
     { key: "facebook", label: "Facebook" },
     { key: "linkedin", label: "LinkedIn" },
 ];
+
+/** Digits for wa.me: US numbers are often stored without the country code. */
+function whatsappDigits(raw?: string): string {
+    const digits = (raw || "").replace(/\D/g, "");
+    return digits.length === 10 ? `1${digits}` : digits;
+}
+
+function handleFromUrl(url: string, domain: string): string | null {
+    try {
+        const u = new URL(url);
+        if (!u.hostname.replace(/^www\./, "").endsWith(domain)) return null;
+        const first = u.pathname.split("/").filter(Boolean)[0];
+        return first && !["p", "reel", "pages", "profile.php", "people", "groups"].includes(first) ? first : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Where to reach this lead on each channel, opening a direct message where
+ * the platform allows it: WhatsApp with the draft pre-filled, Instagram DMs
+ * (ig.me) and Facebook Messenger (m.me) by handle, LinkedIn on the owner's
+ * own profile (or the company page).
+ */
+function channelLink(key: string, lead: Lead, draft: string): { href: string; label: string } | null {
+    if (key === "whatsapp") {
+        const number = lead.whatsapp || lead.phone;
+        const digits = whatsappDigits(number);
+        if (digits.length < 8) return null;
+        return { href: `https://wa.me/${digits}${draft ? `?text=${encodeURIComponent(draft)}` : ""}`, label: number || digits };
+    }
+    if (key === "instagram" && lead.instagram) {
+        const handle = handleFromUrl(lead.instagram, "instagram.com");
+        return { href: handle ? `https://ig.me/m/${handle}` : lead.instagram, label: handle ? `@${handle}` : "Profile" };
+    }
+    if (key === "facebook" && lead.facebook) {
+        const handle = handleFromUrl(lead.facebook, "facebook.com");
+        return { href: handle ? `https://m.me/${handle}` : lead.facebook, label: handle || "Page" };
+    }
+    if (key === "linkedin") {
+        const url = lead.ownerLinkedin || lead.linkedin;
+        if (!url) return null;
+        return { href: url, label: lead.ownerLinkedin ? `${lead.ownerName || "Owner"}'s profile` : "Company page" };
+    }
+    return null;
+}
 
 function CopyButton({ text }: { text: string }) {
     const [copied, setCopied] = useState(false);
@@ -774,7 +821,26 @@ export default function LeadDetailPage() {
                             return (
                                 <div key={key} className="rounded-lg border border-[#164E53] bg-[#0E1D1F] p-4">
                                     <div className="mb-2 flex items-center justify-between">
-                                        <p className="font-bold text-[#2DD4BF] text-xs uppercase tracking-wider">{label}</p>
+                                        <div className="flex min-w-0 items-center gap-3">
+                                            <p className="font-bold text-[#2DD4BF] text-xs uppercase tracking-wider">{label}</p>
+                                            {key !== "email" &&
+                                                (() => {
+                                                    const link = channelLink(key, lead, content || "");
+                                                    return link ? (
+                                                        <a
+                                                            href={link.href}
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            title={key === "whatsapp" ? "Opens WhatsApp with this message filled in" : "Opens a direct message (paste the copied text)"}
+                                                            className="truncate rounded-md border border-[#164E53] bg-[#070C0E] px-2 py-0.5 text-[11px] font-semibold text-slate-200 transition-colors hover:border-[#2DD4BF] hover:text-white"
+                                                        >
+                                                            {link.label} ↗
+                                                        </a>
+                                                    ) : (
+                                                        <span className="text-[11px] text-slate-600">not found</span>
+                                                    );
+                                                })()}
+                                        </div>
                                         <div className="flex items-center gap-2">
                                             <CopyButton text={content || ""} />
                                             {!isManualChannel && (

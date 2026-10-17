@@ -72,6 +72,8 @@ export interface Lead {
     location: string;
     website?: string;
     phone?: string;
+    /** Mobile number used on WhatsApp, when found (else outreach falls back to phone). */
+    whatsapp?: string;
     email?: string;
     instagram?: string;
     facebook?: string;

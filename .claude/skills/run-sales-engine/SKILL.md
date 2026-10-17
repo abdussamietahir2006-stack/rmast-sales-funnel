@@ -302,6 +302,11 @@ For each lead:
    - **Owner:** who owns or runs it. Full name, title (e.g. Broker/Owner),
      personal LinkedIn (linkedin.com/in/...), and direct business email and
      phone if public on their site, license record or profiles.
+   - **WhatsApp / mobile:** a WhatsApp link (wa.me/...) or button on their
+     site is best; otherwise a cell or "call/text" number on their site,
+     Zillow or Realtor.com profile, or license record. Realtors usually list
+     one. Put it in `whatsapp` (the operator checks it). Leave it empty if
+     only an office landline exists; `phone` covers that.
    - **License:** CA DRE or TX TREC number and status.
    - **Active status:** dates of the latest posts, current listings, latest reviews.
    - **Socials, each platform separately (required for every lead):**
@@ -389,6 +394,7 @@ Specific to this business and location, not generic.
   "ownerLinkedin": "https://www.linkedin.com/in/...",
   "email": "owner's direct business email if public, else the business email",
   "phone": "owner's direct business line if public, else the office",
+  "whatsapp": "a mobile number they use, ideally on WhatsApp (e.g. +1 559 555 0142)",
   "licenseInfo": "CA DRE #01234567, licensed (active)",
   "instagram": "https://www.instagram.com/...", "facebook": "https://www.facebook.com/...",
   "linkedin": "https://www.linkedin.com/company/..."
