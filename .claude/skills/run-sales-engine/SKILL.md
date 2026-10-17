@@ -34,7 +34,7 @@ writing. All commands below run from `rmast-sales-engine/`.
 
 - **Inbox mode** (the pre-9 PM run, or "check replies"): steps 0 and 1.
 - **Leads mode** (the 9 PM run, or "get leads"): steps 0, 2, 3, 4 and 5,
-  within a **60-minute budget** (see "Time budget").
+  within about **1.25 minutes per lead** (see "Time and usage budget").
 - Asked to "run the sales engine" without a mode: do both, inbox first.
 
 ## 0. Make sure the engine can reach the app
@@ -162,6 +162,8 @@ node scripts/engine.mjs follow-up <leadId> <followup.json>
 
 One follow-up every 3 days, four in total, each different:
 
+Each message in `messages` shows `opened` (how many times it was opened) when it's ours. If they opened earlier emails but didn't reply, the interest is there: keep it short and make replying effortless (a yes/no question, or the booking link). If nothing was ever opened, try a different, more specific subject angle in the body's first line.
+
 1. (`followUpsSent: 0`) A light nudge with one new specific finding from their audit.
 2. (`1`) A different angle: one quick win they could do this week, from their audit.
 3. (`2`) Short social proof of the idea, e.g. what a refreshed site or
@@ -198,27 +200,26 @@ leads removed, bounces, and anything that failed.
 - `leadsWaitingForWork`: leads still needing processing from earlier runs;
   finish those as part of this run.
 
-## Time budget (leads mode): 60 minutes, in parallel
+## Time and usage budget (leads mode): about 1.25 minutes per lead
 
-The whole leads run must finish within **60 minutes** of starting. Use
-parallel workers with the Agent tool rather than doing everything yourself
-in sequence:
+The operator's weekly Claude usage is limited, and it is spent by work
+(searches, pages read, text written), not by the clock. Keep every lead lean.
 
-1. **Minute 0-20, discovery:** one worker per campaign, at the same time.
-   Give each the campaign's id, name, locations and `remainingToday`, and the
-   full text of steps 3 and 4.2 below. Each adds its leads with `add-leads`
-   and returns how many it added.
-2. **Minute 15-55, processing:** as leads arrive, split the `queue` into
-   batches of about 5 and run up to 5 workers at once. Give each worker its
-   lead ids and the full text of step 4 and "Section schemas and rules"
-   below. Each submits every lead and returns what passed or failed.
-3. **Minute 55:** start nothing new; let running workers finish their current
-   lead. Anything unfinished stays queued for tomorrow.
-4. Log the run (step 5).
-
-Workers must follow the same rules as you; paste them the relevant sections
-verbatim rather than summarising. If the Agent tool isn't available, do the
-same work yourself in order, keeping the 60-minute limit.
+- **Time limit:** `today.totalLeads × 1.25` minutes, rounded up (20 leads → 25
+  minutes), counted from the start of the run. At the limit, finish the lead
+  you're on, log the run, and stop. Anything unfinished stays queued for
+  tomorrow.
+- **Work alone, in order.** Don't use the Agent tool or parallel workers:
+  each worker re-reads all these instructions, which costs more usage than
+  it saves.
+- **Per-lead research allowance: about 8 searches or page fetches in total**
+  (discovery and research combined). A good order: one search that finds the
+  business, the license lookup, its website's contact/about page, then one
+  site-restricted search per social platform. Stop researching once you have
+  what the gates and sections need.
+- **Write tight:** the schemas' minimums are enough. Short findings, no
+  repetition between sections.
+- Don't re-research a lead in a later run; only fill what `missing` lists.
 
 ## 3. Find new leads
 

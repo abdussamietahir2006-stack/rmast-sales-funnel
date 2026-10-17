@@ -241,6 +241,8 @@ interface ThreadMessage {
     providerMessageId?: string;
     internetMessageId?: string;
     sentiment?: string;
+    openCount?: number;
+    lastOpenedAt?: string;
 }
 
 function subjectOf(content: string, companyName: string): string {
@@ -275,6 +277,8 @@ export async function getEmailThreads(db: Db) {
                             providerMessageId: "$providerMessageId",
                             internetMessageId: "$internetMessageId",
                             sentiment: "$sentiment",
+                            openCount: "$openCount",
+                            lastOpenedAt: "$lastOpenedAt",
                         },
                     },
                 },
@@ -327,6 +331,7 @@ export async function getEmailThreads(db: Db) {
                     sentAt: m.sentAt,
                     content: m.content,
                     ...(m.sentiment ? { sentiment: m.sentiment } : {}),
+                    ...(m.direction === "outbound" ? { opened: m.openCount || 0, lastOpenedAt: m.lastOpenedAt || null } : {}),
                 })),
                 lastMessageFrom: last.direction === "inbound" ? "lead" : "us",
                 daysSinceLastMessage,

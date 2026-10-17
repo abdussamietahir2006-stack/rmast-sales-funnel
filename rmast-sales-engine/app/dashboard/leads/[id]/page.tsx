@@ -69,6 +69,10 @@ interface Message {
     direction: string;
     content: string;
     sentAt: string;
+    /** Open tracking, set on sent emails by the tracking pixel. */
+    openCount?: number;
+    firstOpenedAt?: string;
+    lastOpenedAt?: string;
 }
 
 interface Note {
@@ -821,6 +825,16 @@ export default function LeadDetailPage() {
                                         <span>{new Date(m.sentAt).toLocaleString()}</span>
                                     </div>
                                     <p className="text-slate-200">{m.content}</p>
+                                    {m.channel === "email" && m.direction === "outbound" && (
+                                        <p
+                                            className={`mt-2 text-[11px] font-semibold ${m.openCount ? "text-[#34D399]" : "text-slate-500"}`}
+                                            title="Opens are approximate: some email apps block images, and Apple Mail can open them automatically."
+                                        >
+                                            {m.openCount
+                                                ? `👁 Opened ${m.openCount}× · last ${new Date(m.lastOpenedAt || m.firstOpenedAt || m.sentAt).toLocaleString()}`
+                                                : "Not opened yet"}
+                                        </p>
+                                    )}
                                 </div>
                             ))}
                         </div>

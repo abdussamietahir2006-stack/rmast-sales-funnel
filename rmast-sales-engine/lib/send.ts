@@ -112,6 +112,15 @@ export interface EmailOptions {
     /** Message-ID of an earlier email in the thread, so a follow-up shows up
      *  as a reply to it in the recipient's inbox (Gmail sending only). */
     inReplyTo?: string;
+    /** The id this email will be stored under; embeds an open-tracking pixel. */
+    trackingId?: string;
+}
+
+/** A 1x1 image whose URL records that this email was opened. Signed, so
+ *  nobody can fake opens for a message by guessing ids. */
+function trackingPixel(trackingId: string): string {
+    const src = `${appUrl()}/api/public/track/open?t=${encodeURIComponent(signValue("open", trackingId))}`;
+    return `<img src="${src}" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0;opacity:0">`;
 }
 
 /** Gmail sending is configured: the operator's own mailbox sends, and replies
@@ -149,7 +158,7 @@ async function sendEmail(lead: Lead, content: string, options: EmailOptions = {}
         .join("\n")}
 <p style="font-size:12px;color:#6b7280;margin-top:24px">
   Not interested? <a href="${optOut}">Unsubscribe</a> and we won't contact you again.
-</p>`;
+</p>${options.trackingId ? `\n${trackingPixel(options.trackingId)}` : ""}`;
     const text = `${body}\n\n---\nUnsubscribe: ${optOut}`;
     const unsubscribeHeaders = {
         // Required for bulk mail by Gmail and Yahoo, and the clearest
@@ -320,9 +329,10 @@ export async function sendMessage(
     }
 
     let result: SendResult;
+    const messageObjectId = new ObjectId();
 
     if (channel === "email") {
-        result = await sendEmail(lead, content, emailOptions);
+        result = await sendEmail(lead, content, { ...emailOptions, trackingId: messageObjectId.toString() });
     } else if (channel === "whatsapp") {
         result = await sendWhatsApp(lead, content);
     } else {
@@ -335,6 +345,8 @@ export async function sendMessage(
     if (!result.ok) return result;
 
     await db.collection("messages").insertOne({
+        // Chosen before sending, so the email's tracking pixel points at it.
+        _id: messageObjectId,
         leadId,
         channel,
         direction: "outbound",
