@@ -6,6 +6,9 @@ import {
     isQuotaError,
 } from "@/lib/ai";
 import { fetchExternalText } from "@/lib/safe-fetch";
+import { fetchBrandAssets } from "@/lib/brand-assets";
+import { normalizeDemoSiteBrief, renderDemoSite, type DemoSiteBrief } from "@/lib/demo-site";
+import type { AuditArea, AuditReport } from "@/models/lead";
 
 /**
  * The lead pipeline, as plain functions.
@@ -576,6 +579,88 @@ Return JSON exactly:
 }
 
 // --- Audit ----------------------------------------------------------------
+//
+// A whole-business audit, not just a digital-presence score: eight fixed
+// areas, so every report covers the same ground and none can be silently
+// skipped. The model only sees what we actually know (analysis, enrichment,
+// competitors, activity signals and a scrape of their homepage), and is told
+// to report missing data as a finding rather than invent details.
+
+const AUDIT_AREAS = [
+    "Website & User Experience",
+    "Search & Local Visibility",
+    "Social Media & Content",
+    "Brand & Messaging",
+    "Lead Generation & Sales Process",
+    "Customer Experience & Reputation",
+    "Operations & Admin",
+    "Competitive Position",
+] as const;
+
+const AUDIT_STATUSES = ["strong", "needs work", "critical"] as const;
+
+function cleanStrings(value: unknown, max: number): string[] {
+    if (!Array.isArray(value)) return [];
+    return value
+        .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+        .map((v) => v.trim())
+        .slice(0, max);
+}
+
+function statusForScore(score: number): AuditArea["status"] {
+    if (score >= 70) return "strong";
+    if (score >= 40) return "needs work";
+    return "critical";
+}
+
+/** Fills in or drops anything malformed, so a partial model response still
+ *  renders as a coherent report instead of crashing the public audit page. */
+function normalizeAuditReport(raw: Partial<AuditReport> | null | undefined, lead: Lead): AuditReport {
+    const rawAreas = raw && Array.isArray(raw.areas) ? raw.areas : [];
+    const areas: AuditArea[] = rawAreas
+        .filter((a) => a && typeof a.area === "string" && a.area.trim())
+        .slice(0, AUDIT_AREAS.length)
+        .map((a) => {
+            const score = normalizeScore(a.score);
+            return {
+                area: a.area.trim(),
+                score,
+                status: AUDIT_STATUSES.includes(a.status as AuditArea["status"])
+                    ? (a.status as AuditArea["status"])
+                    : statusForScore(score),
+                findings: cleanStrings(a.findings, 4),
+                recommendations: cleanStrings(a.recommendations, 3),
+            };
+        });
+
+    const rawSnapshot = (raw?.snapshot || {}) as Partial<AuditReport["snapshot"]>;
+    const rawPlan = raw && Array.isArray(raw.actionPlan) ? raw.actionPlan : [];
+
+    return {
+        executiveSummary:
+            (typeof raw?.executiveSummary === "string" && raw.executiveSummary.trim()) ||
+            `${lead.companyName} has clear room to grow across several parts of the business.`,
+        snapshot: {
+            whatTheyDo: (typeof rawSnapshot.whatTheyDo === "string" && rawSnapshot.whatTheyDo.trim()) || "",
+            targetCustomers:
+                (typeof rawSnapshot.targetCustomers === "string" && rawSnapshot.targetCustomers.trim()) || "",
+            onlinePresence:
+                (typeof rawSnapshot.onlinePresence === "string" && rawSnapshot.onlinePresence.trim()) || "",
+        },
+        areas,
+        strengths: cleanStrings(raw?.strengths, 4),
+        quickWins: cleanStrings(raw?.quickWins, 5),
+        actionPlan: rawPlan
+            .filter((p) => p && typeof p.phase === "string")
+            .slice(0, 3)
+            .map((p) => ({ phase: p.phase.trim(), items: cleanStrings(p.items, 4) }))
+            .filter((p) => p.items.length > 0),
+        howWeHelp: (raw && Array.isArray(raw.howWeHelp) ? raw.howWeHelp : [])
+            .filter((h) => h && typeof h.service === "string" && typeof h.outcome === "string")
+            .slice(0, 5)
+            .map((h) => ({ service: h.service.trim(), outcome: h.outcome.trim() })),
+    };
+}
 
 export async function generateAudit(db: Db, lead: Lead): Promise<StepResult> {
     const id = lead._id.toString();
@@ -585,23 +670,76 @@ export async function generateAudit(db: Db, lead: Lead): Promise<StepResult> {
     }
     if (!process.env.AI_API_KEY) return aiUnavailable("audit generation");
 
+    const competitors = (lead.competitors || []) as { name: string; strength: string }[];
+    const homepageSnippet = await scrapeHomepageSnippet(lead.website);
+    const socials = (["instagram", "facebook", "linkedin"] as const)
+        .map((key) => `${key}: ${lead[key] || "not found"}`)
+        .join(", ");
+
     const prompt = `
-Write a short, friendly "Top Opportunities" summary (2-3 sentences) for a
-growth audit report being shown to this business owner:
+You are a senior business consultant at RMAST STUDIO writing a complete
+business audit for the owner of ONE specific business. Cover the whole
+business, not just its website.
 
-Business: ${lead.companyName} (${lead.niche} in ${lead.location}, ${lead.market})
-Growth Score: ${lead.growthScore}/100
-Score breakdown: ${JSON.stringify(lead.scores)}
-Specific problems found: ${(lead.problems || []).join("; ")}
+Business: ${lead.companyName}
+Niche: ${lead.niche}
+Location: ${lead.location}, ${lead.market}
+Website: ${lead.website || "none found"}
+Public contact details found: email ${lead.email || "none"}, phone ${lead.phone || "none"}
+Social profiles found: ${socials}
+${homepageSnippet
+            ? `Text scraped from their homepage (the only first-hand view of the business you have):\n"""\n${homepageSnippet}\n"""\n`
+            : "We could not read a homepage for this business.\n"
+        }
+Earlier analysis — growth score ${lead.growthScore}/100, breakdown ${JSON.stringify(lead.scores || {})}
+Problems noted: ${(lead.problems || []).join("; ") || "none recorded"}
+${competitors.length > 0
+            ? `Local competitors (you may reference them by name in the Competitive Position area):\n${competitors
+                .map((c) => `- ${c.name}: ${c.strength}`)
+                .join("\n")}\n`
+            : "No competitor research is available.\n"
+        }${Array.isArray(lead.activitySignals) && lead.activitySignals.length > 0
+            ? `Activity signals: ${lead.activitySignals.join("; ")}\n`
+            : ""
+        }
+Audit exactly these ${AUDIT_AREAS.length} areas, in this order:
+${AUDIT_AREAS.map((a, i) => `${i + 1}. ${a}`).join("\n")}
 
-Write directly to the business owner ("you"), be encouraging but honest
-about the opportunities, and reference at least one specific detail above.
-Plain text only, no markdown, no headers.
+For each area give a 0-100 score (consistent with the earlier breakdown where
+they overlap), a status ("strong", "needs work" or "critical"), 2-4 specific
+findings and 2-3 practical recommendations.
+
+Rules:
+- Only state facts supported by the data above. Where data is missing, say so
+  as a finding (e.g. "We couldn't find an Instagram profile for you") rather
+  than inventing reviews, numbers, staff, prices or opening hours.
+- Write to the owner as "you". Be direct and honest, but constructive.
+- Recommendations may cover anything that would genuinely help the business.
+- "howWeHelp" may ONLY use these RMAST STUDIO services: Website Development,
+  Software Development, Social Media Management, Bookkeeping, Virtual
+  Assistant. Include only the ones that address findings in this audit.
+- Plain text in every field, no markdown.
+
+Return JSON exactly:
+{
+  "executiveSummary": "3-4 sentences: where the business stands and the biggest opportunity",
+  "snapshot": { "whatTheyDo": "1 sentence", "targetCustomers": "1 sentence", "onlinePresence": "1 sentence" },
+  "areas": [{ "area": "name from the list", "score": number, "status": "strong|needs work|critical", "findings": ["..."], "recommendations": ["..."] }],
+  "strengths": ["2-4 things the business already does well"],
+  "quickWins": ["3-5 changes doable within a week"],
+  "actionPlan": [
+    { "phase": "First 30 days", "items": ["..."] },
+    { "phase": "Days 31-60", "items": ["..."] },
+    { "phase": "Days 61-90", "items": ["..."] }
+  ],
+  "howWeHelp": [{ "service": "one of the five services", "outcome": "1 sentence tied to a finding" }]
+}
 `.trim();
 
-    let auditSummary: string;
+    let auditReport: AuditReport;
     try {
-        auditSummary = await callGemini(prompt);
+        const raw = await callGeminiJson<Partial<AuditReport>>(prompt);
+        auditReport = normalizeAuditReport(raw, lead);
     } catch (error) {
         return {
             ok: false,
@@ -610,11 +748,18 @@ Plain text only, no markdown, no headers.
         };
     }
 
+    if (auditReport.areas.length === 0) {
+        return { ok: false, message: "Audit generation returned no findings. Try again." };
+    }
+
     const auditSlug = lead.auditSlug || `${slugify(lead.companyName)}-${id.slice(-6)}`;
 
     await updateLead(db, id, {
         auditSlug,
-        auditSummary,
+        // Kept alongside the full report: the dashboard and outreach still
+        // read the one-paragraph summary.
+        auditSummary: auditReport.executiveSummary,
+        auditReport,
         auditGeneratedAt: new Date().toISOString(),
     });
 
@@ -625,98 +770,12 @@ Plain text only, no markdown, no headers.
 
 // --- Demo -----------------------------------------------------------------
 //
-// Two Gemini calls, deliberately in sequence: the first is a JSON-constrained
-// "creative brief" — positioning, palette, fonts, real section copy — built
-// from everything actually known about this lead (score breakdown, problems,
-// recommendations, competitors, and a scrape of their current site when they
-// have one). The second call executes that brief into HTML. Making every
-// creative decision explicit *before* generating markup is what keeps the
-// result from reading like a template with the company name swapped in — a
-// single "write me a landing page" prompt reliably produces exactly that.
-
-function cleanHtml(raw: string): string {
-    return raw.replace(/```html|```/g, "").trim();
-}
-
-interface DemoBrief {
-    demoDescription: string;
-    positioning: string;
-    colorPalette: {
-        primary: string;
-        secondary: string;
-        accent: string;
-        background: string;
-        text: string;
-    };
-    headingFont: string;
-    bodyFont: string;
-    heroHeadline: string;
-    heroSubheadline: string;
-    problemsAddressed: { problem: string; fix: string }[];
-    sections: { heading: string; copy: string }[];
-    ctaHeadline: string;
-    ctaText: string;
-}
-
-const DEFAULT_PALETTE = {
-    primary: "#0F172A",
-    secondary: "#334155",
-    accent: "#F59E0B",
-    background: "#FFFFFF",
-    text: "#0F172A",
-};
-const HEX_COLOR_RE = /^#[0-9a-fA-F]{3,8}$/;
-const DEFAULT_HEADING_FONT = "Manrope";
-const DEFAULT_BODY_FONT = "Inter";
-
-function normalizePalette(raw: unknown): DemoBrief["colorPalette"] {
-    const source = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-    const pick = (key: keyof typeof DEFAULT_PALETTE) => {
-        const value = source[key];
-        return typeof value === "string" && HEX_COLOR_RE.test(value)
-            ? value
-            : DEFAULT_PALETTE[key];
-    };
-    return {
-        primary: pick("primary"),
-        secondary: pick("secondary"),
-        accent: pick("accent"),
-        background: pick("background"),
-        text: pick("text"),
-    };
-}
-
-/** Fills in anything the model omitted or returned malformed, so a partial
- *  JSON response still produces a coherent (if plainer) brief rather than a
- *  demo build that crashes on a missing field. */
-function normalizeBrief(raw: Partial<DemoBrief> | null | undefined, lead: Lead): DemoBrief {
-    const rawProblems = raw && Array.isArray(raw.problemsAddressed) ? raw.problemsAddressed : [];
-    const problemsAddressed = rawProblems.filter((p) => p?.problem && p?.fix);
-    const fallbackProblems = ((lead.problems as string[] | undefined) || [])
-        .slice(0, 3)
-        .map((problem) => ({ problem, fix: "Addressed directly in this demo." }));
-
-    const rawSections = raw && Array.isArray(raw.sections) ? raw.sections : [];
-    const sections = rawSections.filter((s) => s?.heading && s?.copy);
-
-    return {
-        demoDescription:
-            raw?.demoDescription?.trim() ||
-            `A personalized demo landing page built for ${lead.companyName}.`,
-        positioning:
-            raw?.positioning?.trim() || `${lead.companyName} — ${lead.niche} in ${lead.location}`,
-        colorPalette: normalizePalette(raw?.colorPalette),
-        headingFont: raw?.headingFont?.trim() || DEFAULT_HEADING_FONT,
-        bodyFont: raw?.bodyFont?.trim() || DEFAULT_BODY_FONT,
-        heroHeadline: raw?.heroHeadline?.trim() || lead.companyName,
-        heroSubheadline:
-            raw?.heroSubheadline?.trim() || `A modern digital presence for ${lead.companyName}.`,
-        problemsAddressed: problemsAddressed.length > 0 ? problemsAddressed : fallbackProblems,
-        sections,
-        ctaHeadline: raw?.ctaHeadline?.trim() || "Ready to get started?",
-        ctaText: raw?.ctaText?.trim() || `Reach out to ${lead.companyName} today.`,
-    };
-}
+// One Gemini call writes a JSON "site brief": positioning, palette, fonts,
+// visual style, and real copy for five pages, built from everything actually
+// known about this lead (score breakdown, problems, competitors, and a scrape
+// of their current site). lib/demo-site.ts renders that brief into a complete
+// multi-page site. Making every creative decision explicit in the brief is
+// what keeps the result from reading like a template with the name swapped in.
 
 /** A short, plain-text scrape of the lead's current homepage, when they have
  *  one — grounds the brief in what's actually there instead of guessing from
@@ -748,68 +807,99 @@ export async function generateDemo(db: Db, lead: Lead): Promise<StepResult> {
     if (!process.env.AI_API_KEY) return aiUnavailable("demo generation");
 
     const competitors = (lead.competitors || []) as { name: string; strength: string }[];
-    const homepageSnippet = await scrapeHomepageSnippet(lead.website);
+    const [homepageSnippet, brand] = await Promise.all([
+        scrapeHomepageSnippet(lead.website),
+        fetchBrandAssets(lead.website),
+    ]);
 
     const briefPrompt = `
-You are the creative director at RMAST STUDIO, briefing an award-caliber demo
-landing page for ONE specific business. Every decision must be something a
-different company in a different city could NOT also claim — nothing generic
+You are the creative director at RMAST STUDIO, planning a five-page demo
+website for ONE specific business. Every decision must be something a
+different company in a different city could NOT also claim, nothing generic
 enough that the name could be swapped for another business and reused as-is.
 
 Business: ${lead.companyName}
 Niche: ${lead.niche}
 Location: ${lead.location}, ${lead.market}
-Existing website: ${lead.website || "none — this business has no site today"}
+Existing website: ${lead.website || "none, this business has no site today"}
 ${homepageSnippet
-            ? `Text scraped from their current homepage, for grounding only — do not copy phrases verbatim:\n"""\n${homepageSnippet}\n"""\n`
+            ? `Text scraped from their current homepage, for grounding only (do not copy phrases verbatim):\n"""\n${homepageSnippet}\n"""\n`
             : ""
         }
 Growth score: ${lead.growthScore}/100
 Score breakdown: ${JSON.stringify(lead.scores || {})}
 Specific problems found: ${(lead.problems || []).join("; ") || "weak general online presence"}
-Recommended fixes: ${(lead.recommendations || []).join("; ") || "none recorded"}
 ${competitors.length > 0
-            ? `Real local competitors already identified (for your own positioning judgment only — never name them anywhere in the copy you write):\n${competitors
+            ? `Local competitors (for your own positioning judgment only, never name them in the copy):\n${competitors
                 .map((c) => `- ${c.name}: ${c.strength}`)
                 .join("\n")}\n`
             : ""
         }
-Decide:
-1. A one-sentence positioning statement specific to this exact business.
-2. A 5-color palette (primary, secondary, accent, background, text) as hex
-   codes — bold and specific to the niche, never default blue/white/gray.
-3. Two Google Fonts that pair well together: one for headings (distinctive,
-   confident), one for body text (highly readable).
-4. A hero headline (under 10 words) and a one-sentence subheadline that read
-   like they were written specifically for this business, referencing
-   something concrete about it.
-5. For every specific problem listed above, one sentence describing the
-   exact, visible fix this demo will demonstrate.
-6. Exactly 3 further content sections (e.g. About/Why Us, a niche-relevant
-   showcase, Testimonials) — a heading and 2-3 sentences of real copy for
-   each, not a placeholder description of what the section should contain.
-7. A closing call-to-action headline and one-sentence supporting line.
+The site has five pages: Home, About, Services, a fourth page that fits this
+niche best (e.g. "Menu" for a restaurant, "Listings" for real estate,
+"Projects" for a builder, "Gallery" for a salon, "Work" for an agency), and
+Contact. Decide:
 
-Never use, anywhere in your output: "Welcome to", "Your trusted partner",
-"take your business to the next level", "in today's digital age",
-"state-of-the-art", "boost your online presence", "stand out from the
-competition", a hero with no concrete copy, or lorem ipsum.
+1. siteName (usually the business name) and a short tagline.
+2. style: one of "bold" (dark, punchy hero), "elegant" (refined, luxury),
+   "warm" (friendly, soft, rounded) or "minimal" (clean, airy). Pick what
+   suits this business's customers.
+3. A 5-color palette as hex codes. ${brand.colors.length > 0
+            ? `Their existing brand colors, taken from their own website, are ${brand.colors.join(", ")}. The demo must look like THEIR brand: primary and accent MUST be chosen from these exact hex codes; pick secondary, background and text to complement them.`
+            : "Make it specific to the niche, never default blue/white/gray."
+        } background and text must have strong contrast; accent must stand out on
+   both background and primary.
+4. Two Google Fonts: a distinctive heading font and a readable body font.
+5. Home: hero headline (under 10 words), one-sentence subheadline referencing
+   something concrete about the business, CTA button label, 3 highlights
+   (each a visible fix for one of the problems above, written as a benefit to
+   the customer), and an intro heading plus 2-3 sentences.
+6. About: heading, one-sentence intro, a 2-3 paragraph story, 3 values.
+7. Services: heading, intro, 4-6 services this business plausibly offers,
+   each with a 1-2 sentence description.
+8. The fourth page: navLabel (1-2 words), heading, intro, 3-6 items each
+   with a title, 1-2 sentences and a short tag.
+9. 3 short example testimonials (first name + context, e.g. "Sara, homeowner").
+10. 4 FAQs a real customer of this business would ask, with answers.
+11. Contact heading and intro; a closing CTA headline and one line.
+
+Never invent prices, awards, years in business, client counts or statistics.
+Never use: "Welcome to", "Your trusted partner", "take your business to the
+next level", "in today's digital age", "state-of-the-art", "boost your online
+presence", "stand out from the competition", or lorem ipsum. Plain text only.
 
 Return JSON exactly:
 { "demoDescription": "2-3 sentences describing this demo for an internal dashboard",
-  "positioning": "...",
+  "siteName": "...", "tagline": "...", "style": "bold|elegant|warm|minimal",
   "colorPalette": { "primary": "#hex", "secondary": "#hex", "accent": "#hex", "background": "#hex", "text": "#hex" },
   "headingFont": "Google Font name", "bodyFont": "Google Font name",
-  "heroHeadline": "...", "heroSubheadline": "...",
-  "problemsAddressed": [{ "problem": "...", "fix": "..." }],
-  "sections": [{ "heading": "...", "copy": "..." }],
+  "home": { "heroHeadline": "...", "heroSubheadline": "...", "primaryCta": "...",
+            "introHeading": "...", "introCopy": "...",
+            "highlights": [{ "title": "...", "text": "..." }] },
+  "about": { "heading": "...", "intro": "...", "story": ["paragraph"], "values": [{ "title": "...", "text": "..." }] },
+  "services": { "heading": "...", "intro": "...", "items": [{ "name": "...", "description": "..." }] },
+  "showcase": { "navLabel": "...", "heading": "...", "intro": "...", "items": [{ "title": "...", "text": "...", "tag": "..." }] },
+  "testimonials": [{ "quote": "...", "name": "...", "role": "..." }],
+  "faq": [{ "question": "...", "answer": "..." }],
+  "contact": { "heading": "...", "intro": "..." },
   "ctaHeadline": "...", "ctaText": "..." }
 `.trim();
 
-    let brief: DemoBrief;
+    const business = {
+        companyName: String(lead.companyName),
+        niche: String(lead.niche || ""),
+        location: String(lead.location || ""),
+        market: String(lead.market || ""),
+        phone: typeof lead.phone === "string" ? lead.phone : undefined,
+        email: typeof lead.email === "string" ? lead.email : undefined,
+        problems: Array.isArray(lead.problems) ? (lead.problems as string[]) : [],
+        logoUrl: brand.logoUrl,
+        images: brand.images,
+    };
+
+    let brief: DemoSiteBrief;
     try {
-        const rawBrief = await callGeminiJson<Partial<DemoBrief>>(briefPrompt);
-        brief = normalizeBrief(rawBrief, lead);
+        brief = normalizeDemoSiteBrief(await callGeminiJson<unknown>(briefPrompt), business);
     } catch (error) {
         return {
             ok: false,
@@ -818,98 +908,18 @@ Return JSON exactly:
         };
     }
 
-    // Constructing the Google Fonts link ourselves — rather than trusting the
-    // model to format it — means a font name it picked can never produce a
-    // malformed <link> that quietly fails to load in the finished page.
-    const fontsQuery = [brief.headingFont, brief.bodyFont]
-        .map((font) => `family=${encodeURIComponent(font)}:wght@400;500;600;700;800`)
-        .join("&");
-    const fontsLinkHtml =
-        `<link rel="preconnect" href="https://fonts.googleapis.com">` +
-        `<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>` +
-        `<link href="https://fonts.googleapis.com/css2?${fontsQuery}&display=swap" rel="stylesheet">`;
-
-    const htmlPrompt = `
-Build a single, complete, self-contained HTML page — the highest tier of
-landing page design: Awwwards Site of the Day quality, on the level of
-Linear.app, Stripe.com, or a top luxury brand site. Every decision below was
-made specifically for this business — this must not read like a template
-with the name swapped in.
-
-Business: ${lead.companyName} — ${lead.niche} in ${lead.location}, ${lead.market}
-Positioning: ${brief.positioning}
-Palette — primary ${brief.colorPalette.primary}, secondary ${brief.colorPalette.secondary}, accent ${brief.colorPalette.accent}, background ${brief.colorPalette.background}, text ${brief.colorPalette.text}
-Hero headline: "${brief.heroHeadline}"
-Hero subheadline: "${brief.heroSubheadline}"
-
-Problems this page must visibly fix — each needs a real, working, visible
-element, not a sentence merely claiming it's fixed:
-${brief.problemsAddressed.map((p) => `- ${p.problem} → ${p.fix}`).join("\n") ||
-        "- weak general online presence → a complete, modern, fast-feeling page"
+    // The prompt asks for the brand's own colors; this makes sure of it in
+    // case the model drifted to a palette of its own.
+    const brandColors = brand.colors.map((c) => c.toLowerCase());
+    if (brandColors.length > 0) {
+        const palette = brief.colorPalette;
+        if (!brandColors.includes(palette.primary.toLowerCase())) palette.primary = brandColors[0];
+        if (brandColors.length > 1 && !brandColors.includes(palette.accent.toLowerCase())) {
+            palette.accent = brandColors.find((c) => c !== palette.primary.toLowerCase()) || palette.accent;
         }
-
-Content sections to build, in this order, expanding each into a full section
-with real copy — never placeholder text:
-${brief.sections.map((s) => `- ${s.heading}: ${s.copy}`).join("\n") ||
-        "- About: a short section on why this business is worth choosing"
-        }
-
-Closing call-to-action: "${brief.ctaHeadline}" — ${brief.ctaText}
-
-In the <head>, include exactly this snippet, verbatim, to load the two fonts:
-${fontsLinkHtml}
-Then apply font-family: '${brief.headingFont}', sans-serif to headings and
-font-family: '${brief.bodyFont}', sans-serif to body text, wired through CSS
-custom properties alongside the palette above.
-
-Required build quality:
-1. Apply the palette with intention (not just a tint over everything), via
-   CSS custom properties.
-2. Fluid, confident typography using clamp() for headings; strong
-   weight contrast between headings and body; generous letter-spacing on
-   eyebrow/label text.
-3. A sticky nav bar with smooth-scroll anchor links (scroll-behavior: smooth
-   on <html>, matching id attributes on every section) and a working mobile
-   hamburger menu — vanilla JS only, no external libraries.
-4. At least two distinct scroll-triggered reveal animations using
-   IntersectionObserver (e.g. fade-up on sections, a staggered reveal on a
-   card grid).
-5. One further micro-interaction beyond hover states — a count-up-on-scroll
-   stat, an active nav-link highlight as the user scrolls past each section,
-   or an animated score/progress indicator.
-6. Hover states and transitions (transform, shadow) on every interactive
-   element — buttons, cards, nav links.
-7. A working, styled contact/inquiry form with real client-side validation
-   (required fields, email format check) and a visible success state on
-   submit — it never needs to submit anywhere, just behave correctly.
-8. A deliberately distinct mobile layout, not just a squeezed desktop one.
-9. At the very bottom, include a small, subtle line: "Demo built by RMAST STUDIO"
-
-The page runs inside a sandboxed iframe with no access to its parent, so all
-JavaScript must be self-contained and must never reference window.parent,
-window.top, document.referrer, cookies, or localStorage.
-
-Return ONLY the raw HTML, starting with <!DOCTYPE html>, nothing else — no
-markdown code fences, no explanation.
-`.trim();
-
-    let demoHtml: string;
-    try {
-        demoHtml = cleanHtml(await callGemini(htmlPrompt));
-    } catch (error) {
-        return {
-            ok: false,
-            message: `Demo generation failed: ${String(error)}`,
-            quotaExhausted: isQuotaError(error),
-        };
     }
 
-    if (!demoHtml) {
-        return { ok: false, message: "Demo generation returned an empty page." };
-    }
-    if (!/^<!DOCTYPE html/i.test(demoHtml)) {
-        return { ok: false, message: "Demo generation returned an invalid page. Try again." };
-    }
+    const demoHtml = renderDemoSite(brief, business);
 
     await updateLead(db, id, {
         demoUrl: `/demo/${id}`,
@@ -922,13 +932,18 @@ markdown code fences, no explanation.
         db,
         id,
         "demo_generated",
-        "Personalized interactive demo generated"
+        "Personalized five-page demo website generated"
     );
 
     return {
         ok: true,
         message: "Demo generated.",
-        data: { demoDescription: brief.demoDescription },
+        data: {
+            demoDescription: brief.demoDescription,
+            brandColors: brand.colors,
+            photosFound: brand.images.length,
+            logoFound: Boolean(brand.logoUrl),
+        },
     };
 }
 

@@ -409,7 +409,18 @@ const JSON_SUFFIX =
     "\n\nRespond ONLY with valid JSON, no markdown formatting, no backticks, no preamble.";
 
 export async function callGeminiJson<T>(prompt: string): Promise<T> {
-    return parseJson<T>(await callGemini(prompt + JSON_SUFFIX));
+    try {
+        return parseJson<T>(await callGemini(prompt + JSON_SUFFIX));
+    } catch (error) {
+        // Long structured responses (the audit, the demo brief) occasionally
+        // come back with one malformed element. That's a sampling fluke, not
+        // a pattern, so one fresh attempt nearly always succeeds. Quota and
+        // network errors are rethrown untouched.
+        if (!(error instanceof SyntaxError) && !(error instanceof AiError && /valid JSON/.test(error.message))) {
+            throw error;
+        }
+        return parseJson<T>(await callGemini(prompt + JSON_SUFFIX));
+    }
 }
 
 export async function callGeminiSearchJson<T>(prompt: string): Promise<T> {

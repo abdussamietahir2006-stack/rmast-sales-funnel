@@ -3,9 +3,159 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
+import type { AuditArea, AuditReport } from "@/models/lead";
+
+const STATUS_STYLES: Record<AuditArea["status"], { text: string; bar: string; chip: string }> = {
+    strong: { text: "text-[#4ADE80]", bar: "bg-[#4ADE80]", chip: "border-[#1E3A2B] bg-[#121C16] text-[#4ADE80]" },
+    "needs work": { text: "text-[#FBBF24]", bar: "bg-[#FBBF24]", chip: "border-[#423219] bg-[#1B1710] text-[#FBBF24]" },
+    critical: { text: "text-[#FB7185]", bar: "bg-[#FB7185]", chip: "border-[#4C1D24] bg-[#1F1015] text-[#FB7185]" },
+};
+
+function SectionTitle({ children }: { children: React.ReactNode }) {
+    return <h2 className="mb-4 text-xs font-bold uppercase tracking-wider text-[#2DD4BF]">{children}</h2>;
+}
+
+function BulletList({ items, mark, color }: { items: string[]; mark: string; color: string }) {
+    return (
+        <ul className="space-y-2 text-sm leading-relaxed text-slate-300">
+            {items.map((item, i) => (
+                <li key={i} className="flex items-start gap-2.5">
+                    <span className={`${color} font-bold shrink-0`}>{mark}</span>
+                    <span>{item}</span>
+                </li>
+            ))}
+        </ul>
+    );
+}
+
+function FullReport({ report }: { report: AuditReport }) {
+    const snapshot = [
+        { label: "What you do", value: report.snapshot.whatTheyDo },
+        { label: "Who you serve", value: report.snapshot.targetCustomers },
+        { label: "Online presence", value: report.snapshot.onlinePresence },
+    ].filter((s) => s.value);
+
+    return (
+        <>
+            {snapshot.length > 0 && (
+                <div className="mt-8 grid gap-3.5 sm:grid-cols-3">
+                    {snapshot.map((s) => (
+                        <div key={s.label} className="rounded-xl border border-[#132E32] bg-[#091215] p-5">
+                            <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">{s.label}</p>
+                            <p className="mt-1.5 text-sm leading-relaxed text-slate-300">{s.value}</p>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* Scorecard overview */}
+            <div className="mt-10">
+                <SectionTitle>Business Scorecard</SectionTitle>
+                <div className="space-y-3 rounded-xl border border-[#132E32] bg-[#091215] p-6 shadow-xl">
+                    {report.areas.map((a, i) => {
+                        const style = STATUS_STYLES[a.status];
+                        return (
+                            <a key={a.area} href={`#area-${i}`} className="group grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-1.5 sm:grid-cols-[220px_1fr_auto]">
+                                <span className="text-sm font-medium text-slate-300 group-hover:text-white">{a.area}</span>
+                                <span className="col-span-2 row-start-2 h-2 overflow-hidden rounded-full bg-[#132E32] sm:col-span-1 sm:row-start-auto">
+                                    <span className={`block h-full rounded-full ${style.bar}`} style={{ width: `${a.score}%` }} />
+                                </span>
+                                <span className={`tabular-nums text-sm font-bold ${style.text}`}>{a.score}</span>
+                            </a>
+                        );
+                    })}
+                </div>
+            </div>
+
+            {(report.strengths.length > 0 || report.quickWins.length > 0) && (
+                <div className="mt-8 grid gap-5 sm:grid-cols-2">
+                    {report.strengths.length > 0 && (
+                        <div className="rounded-xl border border-[#1E3A2B] bg-gradient-to-br from-[#121C16] to-[#070C0E] p-6">
+                            <h3 className="mb-3 text-sm font-semibold text-[#4ADE80]">What you&apos;re doing well</h3>
+                            <BulletList items={report.strengths} mark="✓" color="text-[#4ADE80]" />
+                        </div>
+                    )}
+                    {report.quickWins.length > 0 && (
+                        <div className="rounded-xl border border-[#423219] bg-gradient-to-br from-[#1B1710] to-[#070C0E] p-6">
+                            <h3 className="mb-3 text-sm font-semibold text-[#FBBF24]">Quick wins for this week</h3>
+                            <BulletList items={report.quickWins} mark="→" color="text-[#FBBF24]" />
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {/* Area by area */}
+            <div className="mt-10">
+                <SectionTitle>Area-by-Area Findings</SectionTitle>
+                <div className="space-y-4">
+                    {report.areas.map((a, i) => {
+                        const style = STATUS_STYLES[a.status];
+                        return (
+                            <section key={a.area} id={`area-${i}`} className="scroll-mt-6 rounded-xl border border-[#132E32] bg-[#091215] p-6 shadow-lg">
+                                <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                                    <h3 className="text-base font-bold text-white">{a.area}</h3>
+                                    <div className="flex items-center gap-2">
+                                        <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-bold uppercase tracking-wider ${style.chip}`}>{a.status}</span>
+                                        <span className={`tabular-nums text-lg font-black ${style.text}`}>{a.score}<span className="text-xs font-semibold text-slate-500">/100</span></span>
+                                    </div>
+                                </div>
+                                <div className="grid gap-6 sm:grid-cols-2">
+                                    {a.findings.length > 0 && (
+                                        <div>
+                                            <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-slate-500">What we found</p>
+                                            <BulletList items={a.findings} mark="•" color="text-slate-500" />
+                                        </div>
+                                    )}
+                                    {a.recommendations.length > 0 && (
+                                        <div>
+                                            <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-slate-500">What to do</p>
+                                            <BulletList items={a.recommendations} mark="✓" color="text-[#2DD4BF]" />
+                                        </div>
+                                    )}
+                                </div>
+                            </section>
+                        );
+                    })}
+                </div>
+            </div>
+
+            {report.actionPlan.length > 0 && (
+                <div className="mt-10">
+                    <SectionTitle>Your 90-Day Plan</SectionTitle>
+                    <div className="grid gap-4 sm:grid-cols-3">
+                        {report.actionPlan.map((phase, i) => (
+                            <div key={phase.phase} className="rounded-xl border border-[#132E32] bg-[#091215] p-5">
+                                <p className="text-[11px] font-bold uppercase tracking-wider text-[#2DD4BF]">Phase {i + 1}</p>
+                                <h3 className="mb-3 mt-0.5 text-sm font-bold text-white">{phase.phase}</h3>
+                                <BulletList items={phase.items} mark="•" color="text-[#2DD4BF]" />
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {report.howWeHelp.length > 0 && (
+                <div className="mt-10">
+                    <SectionTitle>How RMAST STUDIO Can Help</SectionTitle>
+                    <div className="grid gap-3.5 sm:grid-cols-2">
+                        {report.howWeHelp.map((h) => (
+                            <div key={h.service} className="rounded-xl border border-[#164E53] bg-[#0E1D1F] p-5">
+                                <p className="text-sm font-bold text-[#2DD4BF]">{h.service}</p>
+                                <p className="mt-1 text-sm leading-relaxed text-slate-300">{h.outcome}</p>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+        </>
+    );
+}
 
 interface AuditData {
     companyName: string;
+    niche?: string;
+    location?: string;
+    auditReport?: AuditReport;
     growthScore?: number;
     scores?: {
         website: number;
@@ -116,17 +266,19 @@ export default function AuditPage() {
 
     return (
         <div className="min-h-screen bg-[#070C0E] text-slate-100 antialiased selection:bg-[#2DD4BF]/30 selection:text-[#2DD4BF]">
-            <div className="mx-auto max-w-3xl px-6 py-16">
+            <div className="mx-auto max-w-4xl px-4 py-16 sm:px-6">
                 {/* Header */}
                 <div className="mb-10 text-center sm:text-left border-b border-[#132E32] pb-8">
                     <div className="flex items-center justify-center sm:justify-start gap-2 mb-3">
                         <div className="h-3.5 w-1 rounded-full bg-[#2DD4BF]" />
-                        <span className="text-xs font-extrabold uppercase tracking-widest text-[#2DD4BF]">RMAST STUDIO AUDIT REPORT</span>
+                        <span className="text-xs font-extrabold uppercase tracking-widest text-[#2DD4BF]">RMAST STUDIO BUSINESS AUDIT</span>
                     </div>
                     <h1 className="text-3xl font-extrabold tracking-tight text-white sm:text-4xl">
-                        {audit.companyName}&apos;s Growth Report
+                        {audit.companyName}&apos;s Business Audit
                     </h1>
-                    <p className="mt-2 text-sm text-slate-400">Comprehensive digital presence & growth pipeline assessment.</p>
+                    <p className="mt-2 text-sm text-slate-400">
+                        {[audit.niche, audit.location].filter(Boolean).join(" · ") || "Complete business & growth assessment"}
+                    </p>
                 </div>
 
                 {/* Score Card */}
@@ -145,14 +297,19 @@ export default function AuditPage() {
                 )}
 
                 {/* Summary */}
-                {audit.auditSummary && (
+                {(audit.auditReport?.executiveSummary || audit.auditSummary) && (
                     <div className="mt-8 rounded-xl border border-[#132E32] bg-[#091215] p-6 text-slate-300 text-sm leading-relaxed shadow-lg">
-                        <p>{audit.auditSummary}</p>
+                        {audit.auditReport && (
+                            <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-[#2DD4BF]">Executive Summary</p>
+                        )}
+                        <p>{audit.auditReport?.executiveSummary || audit.auditSummary}</p>
                     </div>
                 )}
 
-                {/* Scores Grid */}
-                {audit.scores && (
+                {audit.auditReport && <FullReport report={audit.auditReport} />}
+
+                {/* Older audits, generated before the full report existed */}
+                {!audit.auditReport && audit.scores && (
                     <div className="mt-8">
                         <h2 className="mb-3 text-xs font-bold uppercase tracking-wider text-[#2DD4BF]">Category Diagnostics</h2>
                         <div className="grid grid-cols-2 gap-3.5 rounded-xl border border-[#132E32] bg-[#091215] p-6 sm:grid-cols-3 shadow-xl">
@@ -185,7 +342,7 @@ export default function AuditPage() {
                 )}
 
                 {/* Problems / Top Opportunities */}
-                {audit.problems && audit.problems.length > 0 && (
+                {!audit.auditReport && audit.problems && audit.problems.length > 0 && (
                     <div className="mt-8 rounded-xl border border-[#4C1D24] bg-gradient-to-br from-[#1F1015] to-[#070C0E] p-6 shadow-xl">
                         <h2 className="mb-3 text-sm font-semibold tracking-tight text-[#FB7185] flex items-center gap-2">
                             <span className="h-2 w-2 rounded-full bg-[#FB7185]" />
@@ -203,7 +360,7 @@ export default function AuditPage() {
                 )}
 
                 {/* Recommendations */}
-                {audit.recommendations && audit.recommendations.length > 0 && (
+                {!audit.auditReport && audit.recommendations && audit.recommendations.length > 0 && (
                     <div className="mt-6 rounded-xl border border-[#1E3A2B] bg-gradient-to-br from-[#121C16] to-[#070C0E] p-6 shadow-xl">
                         <h2 className="mb-3 text-sm font-semibold tracking-tight text-[#4ADE80] flex items-center gap-2">
                             <span className="h-2 w-2 rounded-full bg-[#4ADE80]" />
@@ -227,7 +384,7 @@ export default function AuditPage() {
                             href={audit.demoUrl}
                             className="inline-flex items-center gap-2 rounded-lg border border-[#164E53] bg-[#0E1D1F] px-5 py-3 text-sm font-semibold text-[#2DD4BF] transition-all duration-200 hover:bg-[#0D9488]/20 shadow-[0_0_15px_rgba(20,184,166,0.2)]"
                         >
-                            <span>View Your Personalized Demo</span>
+                            <span>View Your Demo Website</span>
                             <span>→</span>
                         </Link>
                     </div>

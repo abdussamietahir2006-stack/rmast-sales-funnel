@@ -30,6 +30,29 @@ export interface Competitor {
     strength: string;
 }
 
+export interface AuditArea {
+    area: string;
+    score: number;
+    status: "strong" | "needs work" | "critical";
+    findings: string[];
+    recommendations: string[];
+}
+
+/** The full-business audit shown on the public /audit/[slug] page. */
+export interface AuditReport {
+    executiveSummary: string;
+    snapshot: {
+        whatTheyDo: string;
+        targetCustomers: string;
+        onlinePresence: string;
+    };
+    areas: AuditArea[];
+    strengths: string[];
+    quickWins: string[];
+    actionPlan: { phase: string; items: string[] }[];
+    howWeHelp: { service: string; outcome: string }[];
+}
+
 export type LeadStatus =
     | "New"
     | "Analyzing"
@@ -84,6 +107,7 @@ export interface Lead {
     competitorsGeneratedAt?: string;
     auditSlug?: string;
     auditSummary?: string;
+    auditReport?: AuditReport;
     auditGeneratedAt?: string;
     auditLastViewedAt?: string;
     auditViewCount?: number;
