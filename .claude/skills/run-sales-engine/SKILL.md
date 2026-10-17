@@ -1,6 +1,6 @@
 ---
 name: run-sales-engine
-description: Run the RMAST sales funnel with Claude as the AI. Inbox mode - read replies in rmaststudio@gmail.com, answer leads who replied and book meetings, send due follow-ups (every 3 days, max 4) and remove leads that never replied. Leads mode - find today's lead target (set by the operator, split across active campaigns) of small struggling brokerages and solo realtors, verify each is active, research owner and all three socials, then write audit, five-page demo and outreach drafts. Use for the scheduled runs or when asked to run the sales engine, check replies, or get leads. First contact is always the operator's.
+description: Run the RMAST sales funnel with Claude as the AI. Inbox mode - read replies in rmaststudio@gmail.com (via the engine inbox command), answer leads who replied and book meetings, send due follow-ups (every 3 days, max 4) and remove leads that never replied. Leads mode - find today's lead target (set by the operator, split across active campaigns) of small struggling brokerages and solo realtors, verify each is active, research owner and all three socials, then write audit, five-page demo and outreach drafts. Use for the scheduled runs or when asked to run the sales engine, check replies, or get leads. First contact is always the operator's.
 ---
 
 # Run the sales engine
@@ -62,36 +62,44 @@ emailed lead with `ownerName`, `email`, `location`, `originalSubject`, the full
 `messages` list, `meetingBookedFor`, and which step is due: **`needsReply`**,
 **`followUpDue`** (with `followUpsSent`), **`nudgeDue`**, **`retireDue`**.
 
-**If the Gmail connector is unavailable, stop here: record nothing and send
-nothing** (you can't know who replied). Report it.
-
 ### a. Read the inbox and record what arrived
 
-Use the Gmail connector on rmaststudio@gmail.com. Search for messages from
-each thread's `email` since its first message, and for calendar booking
-confirmations. For each **reply** from a lead, record it once:
+```bash
+node scripts/engine.mjs inbox
+```
+
+Reads rmaststudio@gmail.com directly (read-only, last 14 days; pass a number
+of days to change that) and returns only what matters: each message's `kind`
+(`reply` from an emailed lead, `booking` from Google Calendar, `bounce`),
+`leadId`, `companyName`, `from`, `subject`, `receivedAt`, `messageId`, `text`
+(their new words, quoted thread removed) and **`recorded`** (already in the
+app). Act only on messages with `recorded: false`.
+
+**If `inbox` fails, stop here: record nothing and send nothing** (you can't
+know who replied). Report the error. (The Gmail connector, if this session
+has it, is only a fallback for reading; the `inbox` command is the source of
+truth.)
+
+For each unrecorded **reply**, record it once, using `messageId` for both ids:
 
 ```bash
 node scripts/engine.mjs reply <leadId> <reply.json>
 ```
 ```json
-{ "content": "their reply only, without the quoted thread", "receivedAt": "ISO date",
+{ "content": "<text>", "receivedAt": "<receivedAt>",
   "sentiment": "Positive | Neutral | Negative | Not Interested",
-  "providerMessageId": "Gmail message id", "internetMessageId": "<the Message-ID header>" }
+  "providerMessageId": "<messageId>", "internetMessageId": "<messageId>" }
 ```
 
 - Sentiment: **Positive** = interested or asking questions; **Neutral** =
   unclear; **Negative** = annoyed; **Not Interested** = a clear no or "stop"
   (the app opts them out; never email them again).
-- `internetMessageId` is the email's `Message-ID` header; it makes your
-  answer thread under their reply. Include it whenever Gmail shows it.
-- Ignore out-of-office auto-replies.
-- **Bounces** ("Delivery Status Notification", mailer-daemon) for a lead's
-  address: don't record them as replies; list them in the summary so the
-  operator can fix the address.
-- **Booking confirmations** (Google Calendar "booked" / "invitation"
-  emails naming a lead or their email): record the meeting, using the
-  meeting's start time in UTC:
+- Ignore out-of-office auto-replies (don't record them).
+- **Bounces:** don't record; list them in the summary (company + address) so
+  the operator can fix or drop the lead.
+- **Bookings:** read the `text` for the booked time and the booker's details
+  (their email, or the "Brokerage or website" answer) to confirm the lead,
+  then record the meeting with its start time in UTC:
 
   ```bash
   node scripts/engine.mjs meeting <leadId> <meeting.json>
@@ -99,6 +107,9 @@ node scripts/engine.mjs reply <leadId> <reply.json>
   ```json
   { "scheduledAt": "2026-10-21T16:00:00Z", "notes": "what they want to discuss" }
   ```
+
+  A booking with no `leadId` that you can't match to a lead: list it in the
+  summary for the operator.
 
 Run `email` again afterwards so `needsReply` reflects what you recorded.
 

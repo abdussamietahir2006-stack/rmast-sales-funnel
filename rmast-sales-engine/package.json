@@ -9,6 +9,8 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "imapflow": "^2.2.4",
+    "mailparser": "^3.9.34",
     "mongodb": "^7.6.0",
     "next": "16.3.4",
     "nodemailer": "^10.0.14",
@@ -19,6 +21,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/mailparser": "^3.9.0",
     "@types/node": "^20",
     "@types/nodemailer": "^8.0.2",
     "@types/react": "^19",

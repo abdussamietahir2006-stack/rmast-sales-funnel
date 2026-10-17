@@ -10,6 +10,7 @@
  *   node scripts/engine.mjs submit <leadId> <work.json>
  *   node scripts/engine.mjs add-leads <leads.json> [campaignId]
  *   node scripts/engine.mjs email
+ *   node scripts/engine.mjs inbox [days]
  *   node scripts/engine.mjs reply <leadId> <reply.json>
  *   node scripts/engine.mjs follow-up <leadId> <followup.json>
  *   node scripts/engine.mjs send-reply <leadId> <reply.json>
@@ -106,6 +107,9 @@ switch (command) {
         print({ bookingUrl: env.BOOKING_URL || null, ...data });
         break;
     }
+    case "inbox":
+        print(await call("GET", `/api/engine/inbox?days=${Number(args[0]) || 14}`));
+        break;
     case "reply":
         if (!args[0] || !args[1]) throw new Error("usage: reply <leadId> <reply.json>");
         print(await call("POST", `/api/engine/leads/${args[0]}/reply`, readJson(args[1])));
@@ -131,6 +135,6 @@ switch (command) {
         print(await call("POST", "/api/engine/runs", { summary: args.join(" ") }));
         break;
     default:
-        console.error("Commands: status | queue [limit] | context <id> | submit <id> <file> | add-leads <file> [campaignId] | email | reply <id> <file> | follow-up <id> <file> | send-reply <id> <file> | meeting <id> <file> | retire <id> | log-run <summary>");
+        console.error("Commands: status | queue [limit] | context <id> | submit <id> <file> | add-leads <file> [campaignId] | email | inbox [days] | reply <id> <file> | follow-up <id> <file> | send-reply <id> <file> | meeting <id> <file> | retire <id> | log-run <summary>");
         process.exit(1);
 }
