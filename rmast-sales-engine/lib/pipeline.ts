@@ -1,0 +1,1126 @@
+import { Db, ObjectId, WithId, Document } from "mongodb";
+import {
+    callGemini,
+    callGeminiJson,
+    callGeminiSearchJson,
+    isQuotaError,
+} from "@/lib/ai";
+import { fetchExternalText } from "@/lib/safe-fetch";
+
+/**
+ * The lead pipeline, as plain functions.
+ *
+ * These used to live only inside route handlers, so the cron drove them by
+ * fetching its own API six times per lead — sixty chained serverless
+ * invocations in a single request, each paying a cold start and re-opening a
+ * database connection. The route handlers are now thin wrappers around these,
+ * and the cron calls them directly.
+ */
+
+export interface StepResult {
+    ok: boolean;
+    /** Human-readable outcome, used in the cron log and lead activity feed. */
+    message: string;
+    /** True when the step failed because Gemini quota ran out. */
+    quotaExhausted?: boolean;
+    data?: Record<string, unknown>;
+}
+
+export type Lead = WithId<Document>;
+
+export async function logActivity(
+    db: Db,
+    leadId: string,
+    type: string,
+    description: string
+): Promise<void> {
+    await db.collection("activities").insertOne({
+        leadId,
+        type,
+        description,
+        createdAt: new Date().toISOString(),
+    });
+}
+
+export async function getLead(db: Db, id: string): Promise<Lead | null> {
+    if (!ObjectId.isValid(id)) return null;
+    return db.collection("leads").findOne({ _id: new ObjectId(id) });
+}
+
+function slugify(name: string): string {
+    return name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, "");
+}
+
+async function updateLead(
+    db: Db,
+    id: string,
+    fields: Record<string, unknown>
+): Promise<void> {
+    await db
+        .collection("leads")
+        .updateOne({ _id: new ObjectId(id) }, { $set: fields });
+}
+
+function aiUnavailable(step: string): StepResult {
+    return {
+        ok: false,
+        message: `AI API key not configured yet. Add AI_API_KEY to .env.local to enable ${step}.`,
+    };
+}
+
+// --- Activity Verification --------------------------------------------------
+//
+// A Google Places listing has no reason to correct itself once nobody's
+// looking at it — a business from 1990 that closed in 2010 can still show up
+// as "operational" today. Discovery already filters to Places' own
+// `businessStatus === "OPERATIONAL"`, but that field can simply be stale, so
+// this runs before analysis, audit, demo and outreach — the goal is to catch
+// a dead lead before spending any of that effort on it, not after.
+//
+// Deliberately fails open: an inconclusive check (quota, a search error)
+// never blocks a lead — only an explicit "inactive" verdict does. Losing a
+// real lead to a technical hiccup would defeat the point.
+
+export interface ActivityCheckResult {
+    activityScore: number;
+    signals: string[];
+    verdict: "active" | "review" | "inactive";
+}
+
+/** Below this, a lead is flagged inactive and skipped by the scheduled run
+ *  (though never blocked from a manual, operator-triggered action). */
+const INACTIVE_THRESHOLD = 30;
+/** Below this (and at/above INACTIVE_THRESHOLD), flagged "review" — shown to
+ *  the operator, but still allowed to proceed through the funnel normally. */
+const REVIEW_THRESHOLD = 60;
+
+async function checkWebsiteReachable(website?: string): Promise<{ reachable: boolean; note: string }> {
+    if (!website) return { reachable: false, note: "No website listed" };
+    try {
+        const html = await fetchExternalText(website);
+        if (!html) return { reachable: false, note: "Website did not respond" };
+
+        const lower = html.toLowerCase();
+        const parkedSignals = [
+            "domain is for sale",
+            "buy this domain",
+            "this domain may be for sale",
+            "the domain has expired",
+            "future home of something quite cool",
+            "account has been suspended",
+        ];
+        if (parkedSignals.some((s) => lower.includes(s))) {
+            return { reachable: false, note: "Website looks like a parked or expired domain page" };
+        }
+        return { reachable: true, note: "Website responded normally" };
+    } catch {
+        return { reachable: false, note: "Website could not be reached" };
+    }
+}
+
+export async function verifyLeadActivity(db: Db, lead: Lead): Promise<StepResult> {
+    const id = lead._id.toString();
+
+    // A Places-sourced lead already known closed needs no further spend —
+    // free, certain, and doesn't touch Gemini at all.
+    if (lead.businessStatus === "CLOSED_PERMANENTLY" || lead.businessStatus === "CLOSED_TEMPORARILY") {
+        const result: ActivityCheckResult = {
+            activityScore: 0,
+            signals: [`Google Places lists this business as ${lead.businessStatus}`],
+            verdict: "inactive",
+        };
+        await updateLead(db, id, {
+            activityScore: result.activityScore,
+            activitySignals: result.signals,
+            activityVerdict: result.verdict,
+            activityCheckedAt: new Date().toISOString(),
+        });
+        await logActivity(db, id, "activity_checked", `Marked inactive — ${result.signals[0]}`);
+        return { ok: true, message: result.signals[0], data: { ...result } };
+    }
+
+    if (!process.env.AI_API_KEY) return aiUnavailable("activity verification");
+
+    const website = await checkWebsiteReachable(lead.website);
+
+    const prompt = `
+Search for current, public evidence about whether this specific business is
+still actively operating TODAY — not whether it existed at some point.
+
+Business: ${lead.companyName}
+Niche: ${lead.niche}
+Location: ${lead.location}, ${lead.market}
+Website: ${lead.website || "none listed"} — ${website.note}
+Google Places status: ${lead.businessStatus || "unknown"}
+
+Look for recent evidence: recent reviews or review activity, recent social
+media posts or updates, current news or listing mentions, or explicit signs
+of closure ("permanently closed", "out of business", "for lease" at that
+address, no activity in years). An old listing existing online is NOT
+evidence of current activity — weight recent evidence over old, and say so
+plainly if you can't find anything conclusive either way.
+
+Return JSON exactly:
+{ "activityScore": number from 0 (clearly no longer operating) to 100 (clearly active today),
+  "signals": ["short evidence point", "..."],
+  "verdict": "active" | "review" | "inactive" }
+`.trim();
+
+    let result: ActivityCheckResult;
+    try {
+        const raw = await callGeminiSearchJson<Partial<ActivityCheckResult>>(prompt);
+        const activityScore = Math.max(0, Math.min(100, Math.round(Number(raw.activityScore) || 0)));
+        // Derived from the score rather than trusted verbatim from the model,
+        // so the active/review/inactive line is one consistent, tunable rule
+        // rather than whatever label the model felt like using this time.
+        const verdict: ActivityCheckResult["verdict"] =
+            activityScore < INACTIVE_THRESHOLD
+                ? "inactive"
+                : activityScore < REVIEW_THRESHOLD
+                    ? "review"
+                    : "active";
+        result = {
+            activityScore,
+            signals:
+                Array.isArray(raw.signals) && raw.signals.length > 0
+                    ? raw.signals.slice(0, 6).map((s) => String(s))
+                    : [website.note],
+            verdict,
+        };
+    } catch (error) {
+        return {
+            ok: false,
+            message: `Activity check inconclusive: ${String(error)}`,
+            quotaExhausted: isQuotaError(error),
+        };
+    }
+
+    await updateLead(db, id, {
+        activityScore: result.activityScore,
+        activitySignals: result.signals,
+        activityVerdict: result.verdict,
+        activityCheckedAt: new Date().toISOString(),
+    });
+
+    await logActivity(
+        db,
+        id,
+        "activity_checked",
+        `Activity score ${result.activityScore}/100 (${result.verdict})${result.signals[0] ? ` — ${result.signals[0]}` : ""}`
+    );
+
+    return {
+        ok: true,
+        message: `Activity score ${result.activityScore}/100 — ${result.verdict}`,
+        data: { ...result },
+    };
+}
+
+// --- Analyze --------------------------------------------------------------
+
+interface AnalysisResult {
+    scores: {
+        website: number;
+        social: number;
+        leadGeneration: number;
+        conversion: number;
+        seo: number;
+        branding: number;
+    };
+    problems: string[];
+    recommendations: string[];
+}
+
+const SCORE_KEYS = [
+    "website",
+    "social",
+    "leadGeneration",
+    "conversion",
+    "seo",
+    "branding",
+] as const;
+
+/** Clamps a model-supplied score into 0-100, so one bad value can't skew the average. */
+function normalizeScore(value: unknown): number {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return 0;
+    return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+export async function analyzeLead(db: Db, lead: Lead): Promise<StepResult> {
+    const id = lead._id.toString();
+
+    if (!process.env.AI_API_KEY) return aiUnavailable("analysis");
+
+    await updateLead(db, id, { status: "Analyzing" });
+
+    const prompt = `
+You are analyzing a business for a growth agency called RMAST STUDIO.
+
+Business: ${lead.companyName}
+Niche: ${lead.niche}
+Location: ${lead.location}, ${lead.market}
+Website: ${lead.website || "none found"}
+
+Based on this business's niche and the fact that they ${lead.website ? "have a website" : "have no listed website"
+        }, provide a realistic growth analysis. Score each category 0-100.
+Be specific to a business of this type and location, not generic.
+
+Recommendations must ONLY suggest services RMAST STUDIO actually offers:
+Website Development, Software Development, Social Media Management,
+Bookkeeping, or Virtual Assistant services. Do not suggest anything
+outside this list.
+
+Return JSON in this exact shape:
+{
+  "scores": {
+    "website": number,
+    "social": number,
+    "leadGeneration": number,
+    "conversion": number,
+    "seo": number,
+    "branding": number
+  },
+  "problems": ["specific problem 1", "specific problem 2", "specific problem 3"],
+  "recommendations": ["specific fix 1", "specific fix 2", "specific fix 3"]
+}
+`.trim();
+
+    let result: AnalysisResult;
+    try {
+        result = await callGeminiJson<AnalysisResult>(prompt);
+    } catch (error) {
+        // Roll the status back so the lead is picked up again on the next run
+        // instead of being stranded in "Analyzing" forever.
+        await updateLead(db, id, { status: "New" });
+        return {
+            ok: false,
+            message: isQuotaError(error)
+                ? "Analysis skipped: Gemini quota reached. Try again later."
+                : "AI analysis failed to return valid data. Try again.",
+            quotaExhausted: isQuotaError(error),
+        };
+    }
+
+    const scores = Object.fromEntries(
+        SCORE_KEYS.map((key) => [key, normalizeScore(result.scores?.[key])])
+    ) as AnalysisResult["scores"];
+
+    const growthScore = Math.round(
+        SCORE_KEYS.reduce((sum, key) => sum + scores[key], 0) / SCORE_KEYS.length
+    );
+
+    await updateLead(db, id, {
+        status: "Analyzed",
+        scores,
+        growthScore,
+        problems: Array.isArray(result.problems) ? result.problems : [],
+        recommendations: Array.isArray(result.recommendations)
+            ? result.recommendations
+            : [],
+        analyzedAt: new Date().toISOString(),
+    });
+
+    await logActivity(db, id, "analyzed", "Lead was analyzed");
+
+    return { ok: true, message: "Analysis complete.", data: { growthScore } };
+}
+
+// --- Enrich ---------------------------------------------------------------
+
+interface ScrapedContact {
+    email?: string;
+    ownerName?: string;
+}
+
+interface SocialProfiles {
+    instagram?: string;
+    facebook?: string;
+    linkedin?: string;
+}
+
+async function scrapeWebsiteContact(website: string): Promise<ScrapedContact> {
+    try {
+        const html = await fetchExternalText(website);
+        if (!html) return {};
+
+        const text = html.replace(/<[^>]+>/g, " ").slice(0, 8000);
+
+        const prompt = `
+Here is raw text extracted from a business's website homepage:
+"""
+${text}
+"""
+
+Extract, if present: a contact email address, and an owner/manager's name
+(only if clearly stated, e.g. "Founded by..." or "Contact John at..").
+Return JSON exactly: { "email": "found email or empty string", "ownerName": "found name or empty string" }
+`.trim();
+
+        return await callGeminiJson<ScrapedContact>(prompt);
+    } catch {
+        return {};
+    }
+}
+
+async function findSocialProfiles(
+    companyName: string,
+    location: string
+): Promise<SocialProfiles> {
+    try {
+        const prompt = `
+Search for the real, public Instagram, Facebook, and LinkedIn profile
+pages for this specific business: "${companyName}" located in ${location}.
+
+Only return a URL if you find a genuine, specific match for THIS exact
+business — do not guess or invent a URL, and do not return a generic
+search results page. If you cannot confirm a real profile for a platform,
+leave that field as an empty string.
+
+Return JSON exactly:
+{ "instagram": "full URL or empty string", "facebook": "full URL or empty string", "linkedin": "full URL or empty string" }
+`.trim();
+
+        return await callGeminiSearchJson<SocialProfiles>(prompt);
+    } catch {
+        return {};
+    }
+}
+
+export async function enrichLead(db: Db, lead: Lead): Promise<StepResult> {
+    const id = lead._id.toString();
+
+    let email: string | undefined = lead.email;
+    let ownerName: string | undefined = lead.ownerName;
+    let contactSource: string | undefined = lead.contactSource;
+
+    if (!email && lead.website && process.env.AI_API_KEY) {
+        const scraped = await scrapeWebsiteContact(lead.website);
+        if (scraped.email) {
+            email = scraped.email;
+            contactSource = "website";
+        }
+        if (scraped.ownerName) {
+            ownerName = scraped.ownerName;
+        }
+    }
+
+    if (!email && lead.website && process.env.ENRICHMENT_API_KEY) {
+        // --- Hunter.io / Apollo.io lookup goes here once that key is added ---
+    }
+
+    const phone = lead.phone;
+    const hasDirectContact = !!email || !!phone;
+
+    let instagram = lead.instagram;
+    let facebook = lead.facebook;
+    let linkedin = lead.linkedin;
+    let contactMethod: "direct" | "social_manual" | "unreachable" = "direct";
+
+    if (!hasDirectContact && process.env.AI_API_KEY) {
+        const found = await findSocialProfiles(lead.companyName, lead.location);
+        instagram = found.instagram || instagram;
+        facebook = found.facebook || facebook;
+        linkedin = found.linkedin || linkedin;
+
+        const hasSocial = !!instagram || !!facebook || !!linkedin;
+        contactMethod = hasSocial ? "social_manual" : "unreachable";
+    } else if (!hasDirectContact) {
+        const hasSocial = !!instagram || !!facebook || !!linkedin;
+        contactMethod = hasSocial ? "social_manual" : "unreachable";
+    }
+
+    await updateLead(db, id, {
+        email: email || lead.email || "",
+        ownerName: ownerName || lead.ownerName || "",
+        contactSource: contactSource || lead.contactSource || "google_places",
+        instagram: instagram || lead.instagram || "",
+        facebook: facebook || lead.facebook || "",
+        linkedin: linkedin || lead.linkedin || "",
+        contactMethod,
+        enrichedAt: new Date().toISOString(),
+    });
+
+    const statusMessage =
+        contactMethod === "direct"
+            ? `Enrichment complete (source: ${contactSource || "google_places"})`
+            : contactMethod === "social_manual"
+                ? "No email/phone found — real social profiles found via search for manual outreach"
+                : "No email, phone, or social profiles found — flagged as unreachable";
+
+    await logActivity(db, id, "enriched", statusMessage);
+
+    return {
+        ok: true,
+        message: statusMessage,
+        data: {
+            contactMethod,
+            email: email || null,
+            phone: phone || null,
+            instagram: instagram || null,
+            facebook: facebook || null,
+            linkedin: linkedin || null,
+        },
+    };
+}
+
+// --- Competitors ----------------------------------------------------------
+//
+// This is directional market research for one specific lead — grounded
+// search results, never verified data — and it must stay scoped to that
+// lead: stored only on its own `competitors` array, never surfaced as a
+// cross-lead directory, and never carrying contact details we didn't ask for
+// and can't verify.
+
+interface RawCompetitor {
+    name?: unknown;
+    website?: unknown;
+    strength?: unknown;
+    // Anything else the model attaches (a phone number, an email, a
+    // "WhatsApp") is discarded by sanitizeCompetitors below rather than
+    // trusted through to storage.
+    [key: string]: unknown;
+}
+
+interface CompetitorResult {
+    competitors: RawCompetitor[];
+}
+
+const MAX_COMPETITORS = 4;
+
+/** Keeps only the three fields ever requested, regardless of what the model
+ *  actually returned — the one place this data is trusted into the database. */
+function sanitizeCompetitors(
+    raw: RawCompetitor[]
+): { name: string; website: string; strength: string }[] {
+    return raw
+        .map((c) => ({
+            name: String(c?.name ?? "").trim().slice(0, 200),
+            website: String(c?.website ?? "").trim().slice(0, 300),
+            strength: String(c?.strength ?? "").trim().slice(0, 500),
+        }))
+        .filter((c) => c.name.length > 0)
+        .slice(0, MAX_COMPETITORS);
+}
+
+export async function findCompetitorsForLead(
+    db: Db,
+    lead: Lead
+): Promise<StepResult> {
+    const id = lead._id.toString();
+
+    if (!lead.growthScore) {
+        return { ok: false, message: "Analyze this lead before finding competitors." };
+    }
+    if (!process.env.AI_API_KEY) return aiUnavailable("competitor analysis");
+
+    const prompt = `
+Search for up to 2 real, actual, named ${lead.niche} businesses operating in
+or very near ${lead.location}, ${lead.market}, that would be realistic local
+competitors to "${lead.companyName}".
+
+For each one you find, briefly note ONE specific advantage they likely
+have based on what's publicly visible about them (e.g. their website,
+reviews, or online presence), relevant to these problems the target
+business has: ${(lead.problems || []).join("; ") || "none recorded"}
+
+Only include a business if you can find real evidence it exists near
+this location — do not invent names or websites.
+
+This is directional market research only, never verified contact data. Do
+NOT include a phone number, email address, WhatsApp number, or any other
+contact detail for any competitor, even if you happen to find one — return
+only the three fields below and nothing else.
+
+Return JSON exactly:
+{ "competitors": [{ "name": "real business name", "website": "their real website URL if found, else empty string", "strength": "specific advantage" }] }
+`.trim();
+
+    let competitors: { name: string; website: string; strength: string }[] = [];
+    let skippedReason = "";
+    let quotaExhausted = false;
+
+    try {
+        const result = await callGeminiSearchJson<CompetitorResult>(prompt);
+        competitors = sanitizeCompetitors(Array.isArray(result.competitors) ? result.competitors : []);
+    } catch (error) {
+        quotaExhausted = isQuotaError(error);
+        skippedReason = quotaExhausted
+            ? "Competitor search skipped: Gemini's free-tier search quota was reached. Enable billing on your API key to remove this limit, or try again later."
+            : `Competitor search skipped due to an error: ${String(error)}`;
+    }
+
+    await updateLead(db, id, {
+        competitors,
+        competitorsGeneratedAt: new Date().toISOString(),
+    });
+
+    await logActivity(
+        db,
+        id,
+        "competitors_found",
+        skippedReason || `Found ${competitors.length} real local competitors via search`
+    );
+
+    // Competitors are a nice-to-have enrichment, not a gate: a skipped search
+    // must not stop the audit and outreach that follow.
+    return {
+        ok: true,
+        message: skippedReason || `Found ${competitors.length} competitors.`,
+        quotaExhausted,
+        data: { competitors, warning: skippedReason || undefined },
+    };
+}
+
+// --- Audit ----------------------------------------------------------------
+
+export async function generateAudit(db: Db, lead: Lead): Promise<StepResult> {
+    const id = lead._id.toString();
+
+    if (!lead.growthScore) {
+        return { ok: false, message: "Analyze this lead before generating an audit." };
+    }
+    if (!process.env.AI_API_KEY) return aiUnavailable("audit generation");
+
+    const prompt = `
+Write a short, friendly "Top Opportunities" summary (2-3 sentences) for a
+growth audit report being shown to this business owner:
+
+Business: ${lead.companyName} (${lead.niche} in ${lead.location}, ${lead.market})
+Growth Score: ${lead.growthScore}/100
+Score breakdown: ${JSON.stringify(lead.scores)}
+Specific problems found: ${(lead.problems || []).join("; ")}
+
+Write directly to the business owner ("you"), be encouraging but honest
+about the opportunities, and reference at least one specific detail above.
+Plain text only, no markdown, no headers.
+`.trim();
+
+    let auditSummary: string;
+    try {
+        auditSummary = await callGemini(prompt);
+    } catch (error) {
+        return {
+            ok: false,
+            message: `Audit generation failed: ${String(error)}`,
+            quotaExhausted: isQuotaError(error),
+        };
+    }
+
+    const auditSlug = lead.auditSlug || `${slugify(lead.companyName)}-${id.slice(-6)}`;
+
+    await updateLead(db, id, {
+        auditSlug,
+        auditSummary,
+        auditGeneratedAt: new Date().toISOString(),
+    });
+
+    await logActivity(db, id, "audit_generated", "Growth audit generated");
+
+    return { ok: true, message: "Audit generated.", data: { auditSlug } };
+}
+
+// --- Demo -----------------------------------------------------------------
+//
+// Two Gemini calls, deliberately in sequence: the first is a JSON-constrained
+// "creative brief" — positioning, palette, fonts, real section copy — built
+// from everything actually known about this lead (score breakdown, problems,
+// recommendations, competitors, and a scrape of their current site when they
+// have one). The second call executes that brief into HTML. Making every
+// creative decision explicit *before* generating markup is what keeps the
+// result from reading like a template with the company name swapped in — a
+// single "write me a landing page" prompt reliably produces exactly that.
+
+function cleanHtml(raw: string): string {
+    return raw.replace(/```html|```/g, "").trim();
+}
+
+interface DemoBrief {
+    demoDescription: string;
+    positioning: string;
+    colorPalette: {
+        primary: string;
+        secondary: string;
+        accent: string;
+        background: string;
+        text: string;
+    };
+    headingFont: string;
+    bodyFont: string;
+    heroHeadline: string;
+    heroSubheadline: string;
+    problemsAddressed: { problem: string; fix: string }[];
+    sections: { heading: string; copy: string }[];
+    ctaHeadline: string;
+    ctaText: string;
+}
+
+const DEFAULT_PALETTE = {
+    primary: "#0F172A",
+    secondary: "#334155",
+    accent: "#F59E0B",
+    background: "#FFFFFF",
+    text: "#0F172A",
+};
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{3,8}$/;
+const DEFAULT_HEADING_FONT = "Manrope";
+const DEFAULT_BODY_FONT = "Inter";
+
+function normalizePalette(raw: unknown): DemoBrief["colorPalette"] {
+    const source = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+    const pick = (key: keyof typeof DEFAULT_PALETTE) => {
+        const value = source[key];
+        return typeof value === "string" && HEX_COLOR_RE.test(value)
+            ? value
+            : DEFAULT_PALETTE[key];
+    };
+    return {
+        primary: pick("primary"),
+        secondary: pick("secondary"),
+        accent: pick("accent"),
+        background: pick("background"),
+        text: pick("text"),
+    };
+}
+
+/** Fills in anything the model omitted or returned malformed, so a partial
+ *  JSON response still produces a coherent (if plainer) brief rather than a
+ *  demo build that crashes on a missing field. */
+function normalizeBrief(raw: Partial<DemoBrief> | null | undefined, lead: Lead): DemoBrief {
+    const rawProblems = raw && Array.isArray(raw.problemsAddressed) ? raw.problemsAddressed : [];
+    const problemsAddressed = rawProblems.filter((p) => p?.problem && p?.fix);
+    const fallbackProblems = ((lead.problems as string[] | undefined) || [])
+        .slice(0, 3)
+        .map((problem) => ({ problem, fix: "Addressed directly in this demo." }));
+
+    const rawSections = raw && Array.isArray(raw.sections) ? raw.sections : [];
+    const sections = rawSections.filter((s) => s?.heading && s?.copy);
+
+    return {
+        demoDescription:
+            raw?.demoDescription?.trim() ||
+            `A personalized demo landing page built for ${lead.companyName}.`,
+        positioning:
+            raw?.positioning?.trim() || `${lead.companyName} — ${lead.niche} in ${lead.location}`,
+        colorPalette: normalizePalette(raw?.colorPalette),
+        headingFont: raw?.headingFont?.trim() || DEFAULT_HEADING_FONT,
+        bodyFont: raw?.bodyFont?.trim() || DEFAULT_BODY_FONT,
+        heroHeadline: raw?.heroHeadline?.trim() || lead.companyName,
+        heroSubheadline:
+            raw?.heroSubheadline?.trim() || `A modern digital presence for ${lead.companyName}.`,
+        problemsAddressed: problemsAddressed.length > 0 ? problemsAddressed : fallbackProblems,
+        sections,
+        ctaHeadline: raw?.ctaHeadline?.trim() || "Ready to get started?",
+        ctaText: raw?.ctaText?.trim() || `Reach out to ${lead.companyName} today.`,
+    };
+}
+
+/** A short, plain-text scrape of the lead's current homepage, when they have
+ *  one — grounds the brief in what's actually there instead of guessing from
+ *  niche alone. Best-effort: a failed fetch just means a plainer brief, same
+ *  as the SSRF-guarded fetch already used during enrichment. */
+async function scrapeHomepageSnippet(website?: string): Promise<string> {
+    if (!website) return "";
+    try {
+        const html = await fetchExternalText(website);
+        if (!html) return "";
+        return html
+            .replace(/<script[\s\S]*?<\/script>/gi, " ")
+            .replace(/<style[\s\S]*?<\/style>/gi, " ")
+            .replace(/<[^>]+>/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 3000);
+    } catch {
+        return "";
+    }
+}
+
+export async function generateDemo(db: Db, lead: Lead): Promise<StepResult> {
+    const id = lead._id.toString();
+
+    if (!lead.growthScore) {
+        return { ok: false, message: "Analyze this lead before generating a demo." };
+    }
+    if (!process.env.AI_API_KEY) return aiUnavailable("demo generation");
+
+    const competitors = (lead.competitors || []) as { name: string; strength: string }[];
+    const homepageSnippet = await scrapeHomepageSnippet(lead.website);
+
+    const briefPrompt = `
+You are the creative director at RMAST STUDIO, briefing an award-caliber demo
+landing page for ONE specific business. Every decision must be something a
+different company in a different city could NOT also claim — nothing generic
+enough that the name could be swapped for another business and reused as-is.
+
+Business: ${lead.companyName}
+Niche: ${lead.niche}
+Location: ${lead.location}, ${lead.market}
+Existing website: ${lead.website || "none — this business has no site today"}
+${homepageSnippet
+            ? `Text scraped from their current homepage, for grounding only — do not copy phrases verbatim:\n"""\n${homepageSnippet}\n"""\n`
+            : ""
+        }
+Growth score: ${lead.growthScore}/100
+Score breakdown: ${JSON.stringify(lead.scores || {})}
+Specific problems found: ${(lead.problems || []).join("; ") || "weak general online presence"}
+Recommended fixes: ${(lead.recommendations || []).join("; ") || "none recorded"}
+${competitors.length > 0
+            ? `Real local competitors already identified (for your own positioning judgment only — never name them anywhere in the copy you write):\n${competitors
+                .map((c) => `- ${c.name}: ${c.strength}`)
+                .join("\n")}\n`
+            : ""
+        }
+Decide:
+1. A one-sentence positioning statement specific to this exact business.
+2. A 5-color palette (primary, secondary, accent, background, text) as hex
+   codes — bold and specific to the niche, never default blue/white/gray.
+3. Two Google Fonts that pair well together: one for headings (distinctive,
+   confident), one for body text (highly readable).
+4. A hero headline (under 10 words) and a one-sentence subheadline that read
+   like they were written specifically for this business, referencing
+   something concrete about it.
+5. For every specific problem listed above, one sentence describing the
+   exact, visible fix this demo will demonstrate.
+6. Exactly 3 further content sections (e.g. About/Why Us, a niche-relevant
+   showcase, Testimonials) — a heading and 2-3 sentences of real copy for
+   each, not a placeholder description of what the section should contain.
+7. A closing call-to-action headline and one-sentence supporting line.
+
+Never use, anywhere in your output: "Welcome to", "Your trusted partner",
+"take your business to the next level", "in today's digital age",
+"state-of-the-art", "boost your online presence", "stand out from the
+competition", a hero with no concrete copy, or lorem ipsum.
+
+Return JSON exactly:
+{ "demoDescription": "2-3 sentences describing this demo for an internal dashboard",
+  "positioning": "...",
+  "colorPalette": { "primary": "#hex", "secondary": "#hex", "accent": "#hex", "background": "#hex", "text": "#hex" },
+  "headingFont": "Google Font name", "bodyFont": "Google Font name",
+  "heroHeadline": "...", "heroSubheadline": "...",
+  "problemsAddressed": [{ "problem": "...", "fix": "..." }],
+  "sections": [{ "heading": "...", "copy": "..." }],
+  "ctaHeadline": "...", "ctaText": "..." }
+`.trim();
+
+    let brief: DemoBrief;
+    try {
+        const rawBrief = await callGeminiJson<Partial<DemoBrief>>(briefPrompt);
+        brief = normalizeBrief(rawBrief, lead);
+    } catch (error) {
+        return {
+            ok: false,
+            message: `Demo generation failed: ${String(error)}`,
+            quotaExhausted: isQuotaError(error),
+        };
+    }
+
+    // Constructing the Google Fonts link ourselves — rather than trusting the
+    // model to format it — means a font name it picked can never produce a
+    // malformed <link> that quietly fails to load in the finished page.
+    const fontsQuery = [brief.headingFont, brief.bodyFont]
+        .map((font) => `family=${encodeURIComponent(font)}:wght@400;500;600;700;800`)
+        .join("&");
+    const fontsLinkHtml =
+        `<link rel="preconnect" href="https://fonts.googleapis.com">` +
+        `<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>` +
+        `<link href="https://fonts.googleapis.com/css2?${fontsQuery}&display=swap" rel="stylesheet">`;
+
+    const htmlPrompt = `
+Build a single, complete, self-contained HTML page — the highest tier of
+landing page design: Awwwards Site of the Day quality, on the level of
+Linear.app, Stripe.com, or a top luxury brand site. Every decision below was
+made specifically for this business — this must not read like a template
+with the name swapped in.
+
+Business: ${lead.companyName} — ${lead.niche} in ${lead.location}, ${lead.market}
+Positioning: ${brief.positioning}
+Palette — primary ${brief.colorPalette.primary}, secondary ${brief.colorPalette.secondary}, accent ${brief.colorPalette.accent}, background ${brief.colorPalette.background}, text ${brief.colorPalette.text}
+Hero headline: "${brief.heroHeadline}"
+Hero subheadline: "${brief.heroSubheadline}"
+
+Problems this page must visibly fix — each needs a real, working, visible
+element, not a sentence merely claiming it's fixed:
+${brief.problemsAddressed.map((p) => `- ${p.problem} → ${p.fix}`).join("\n") ||
+        "- weak general online presence → a complete, modern, fast-feeling page"
+        }
+
+Content sections to build, in this order, expanding each into a full section
+with real copy — never placeholder text:
+${brief.sections.map((s) => `- ${s.heading}: ${s.copy}`).join("\n") ||
+        "- About: a short section on why this business is worth choosing"
+        }
+
+Closing call-to-action: "${brief.ctaHeadline}" — ${brief.ctaText}
+
+In the <head>, include exactly this snippet, verbatim, to load the two fonts:
+${fontsLinkHtml}
+Then apply font-family: '${brief.headingFont}', sans-serif to headings and
+font-family: '${brief.bodyFont}', sans-serif to body text, wired through CSS
+custom properties alongside the palette above.
+
+Required build quality:
+1. Apply the palette with intention (not just a tint over everything), via
+   CSS custom properties.
+2. Fluid, confident typography using clamp() for headings; strong
+   weight contrast between headings and body; generous letter-spacing on
+   eyebrow/label text.
+3. A sticky nav bar with smooth-scroll anchor links (scroll-behavior: smooth
+   on <html>, matching id attributes on every section) and a working mobile
+   hamburger menu — vanilla JS only, no external libraries.
+4. At least two distinct scroll-triggered reveal animations using
+   IntersectionObserver (e.g. fade-up on sections, a staggered reveal on a
+   card grid).
+5. One further micro-interaction beyond hover states — a count-up-on-scroll
+   stat, an active nav-link highlight as the user scrolls past each section,
+   or an animated score/progress indicator.
+6. Hover states and transitions (transform, shadow) on every interactive
+   element — buttons, cards, nav links.
+7. A working, styled contact/inquiry form with real client-side validation
+   (required fields, email format check) and a visible success state on
+   submit — it never needs to submit anywhere, just behave correctly.
+8. A deliberately distinct mobile layout, not just a squeezed desktop one.
+9. At the very bottom, include a small, subtle line: "Demo built by RMAST STUDIO"
+
+The page runs inside a sandboxed iframe with no access to its parent, so all
+JavaScript must be self-contained and must never reference window.parent,
+window.top, document.referrer, cookies, or localStorage.
+
+Return ONLY the raw HTML, starting with <!DOCTYPE html>, nothing else — no
+markdown code fences, no explanation.
+`.trim();
+
+    let demoHtml: string;
+    try {
+        demoHtml = cleanHtml(await callGemini(htmlPrompt));
+    } catch (error) {
+        return {
+            ok: false,
+            message: `Demo generation failed: ${String(error)}`,
+            quotaExhausted: isQuotaError(error),
+        };
+    }
+
+    if (!demoHtml) {
+        return { ok: false, message: "Demo generation returned an empty page." };
+    }
+    if (!/^<!DOCTYPE html/i.test(demoHtml)) {
+        return { ok: false, message: "Demo generation returned an invalid page. Try again." };
+    }
+
+    await updateLead(db, id, {
+        demoUrl: `/demo/${id}`,
+        demoHtml,
+        demoDescription: brief.demoDescription,
+        demoGeneratedAt: new Date().toISOString(),
+    });
+
+    await logActivity(
+        db,
+        id,
+        "demo_generated",
+        "Personalized interactive demo generated"
+    );
+
+    return {
+        ok: true,
+        message: "Demo generated.",
+        data: { demoDescription: brief.demoDescription },
+    };
+}
+
+// --- Outreach -------------------------------------------------------------
+
+const GENERIC_PHRASES = [
+    "grow your business",
+    "boost your online presence",
+    "take your business to the next level",
+    "unlock your potential",
+    "stand out from the competition",
+    "in today's digital age",
+];
+
+function looksGeneric(message: string): boolean {
+    const lower = message.toLowerCase();
+    const genericHits = GENERIC_PHRASES.filter((p) => lower.includes(p)).length;
+    return genericHits >= 2;
+}
+
+export const OUTREACH_CHANNELS = [
+    "email",
+    "whatsapp",
+    "instagram",
+    "facebook",
+    "linkedin",
+] as const;
+
+/**
+ * The exact, absolute URLs for the audit report and demo page. These are
+ * never left to the model to reproduce — asking an LLM to "include a link
+ * naturally" in prose reliably gets it paraphrased, shortened, or subtly
+ * wrong. Every outreach message gets the real thing, appended verbatim.
+ */
+function buildOutreachLinks(lead: Lead): { auditLink?: string; demoLink?: string } {
+    const appUrl = (process.env.NEXT_PUBLIC_APP_URL || "").replace(/\/$/, "");
+    return {
+        auditLink: lead.auditSlug ? `${appUrl}/audit/${lead.auditSlug}` : undefined,
+        demoLink: lead.demoUrl ? `${appUrl}${lead.demoUrl}` : undefined,
+    };
+}
+
+/** The one place these links reach the message — appended after the AI copy,
+ *  never generated by it, so they can never come out truncated or wrong. */
+function appendOutreachLinks(
+    message: string,
+    auditLink: string | undefined,
+    demoLink: string | undefined
+): string {
+    const lines: string[] = [];
+    if (auditLink) lines.push(`Growth Report: ${auditLink}`);
+    if (demoLink) lines.push(`Live Demo: ${demoLink}`);
+    return lines.length > 0 ? `${message}\n\n${lines.join("\n")}` : message;
+}
+
+function buildOutreachPrompt(
+    lead: Lead,
+    channel: string,
+    auditLink: string | undefined,
+    demoLink: string | undefined
+): string {
+    const competitors = (lead.competitors || []) as {
+        name: string;
+        strength: string;
+    }[];
+
+    const competitorSection =
+        competitors.length > 0
+            ? `
+Local competitors for reference (mention ONE of these if it strengthens
+the message, naming the competitor and their specific advantage):
+${competitors.map((c) => `- ${c.name}: ${c.strength}`).join("\n")}
+`
+            : "";
+
+    const preparedAssets = [
+        auditLink ? "a personalized growth report" : null,
+        demoLink ? "a personalized demo webpage" : null,
+    ]
+        .filter(Boolean)
+        .join(" and ");
+
+    const linkInstruction = preparedAssets
+        ? `\nYou have already prepared ${preparedAssets} for this business. In ONE short sentence near the end, mention that it's ready and worth a look. Do NOT write out a URL, a link, or placeholder link text like "[link]" or "click here" — the exact links are appended after your message automatically, verbatim.\n`
+        : "";
+
+    return `
+You are writing a cold outreach message on behalf of RMAST STUDIO, a growth
+agency offering: Website Development, Software Development, Social Media
+Management, Bookkeeping, and Virtual Assistant services.
+
+Business being contacted:
+- Name: ${lead.companyName}
+- Niche: ${lead.niche}
+- Location: ${lead.location}, ${lead.market}
+- Website: ${lead.website || "none found"}
+
+Specific analysis findings for THIS business (use these, do not invent new ones):
+- Score breakdown: ${JSON.stringify(lead.scores || {})}
+- Specific problems found: ${(lead.problems || []).join("; ") || "none recorded"}
+- Recommended fixes: ${(lead.recommendations || []).join("; ") || "none recorded"}
+${competitorSection}${linkInstruction}
+Rules:
+1. Reference at least one CONCRETE, SPECIFIC detail from the findings above.
+2. Do NOT use generic filler phrases like "grow your business," "boost your
+   online presence," "take it to the next level," "unlock your potential,"
+   or "stand out from the competition."
+3. Keep it short (2-4 sentences), friendly, and low-pressure.
+4. If a competitor comparison is provided above, weave it in naturally as
+   a light, non-aggressive nudge — not a harsh callout.
+5. Only mention RMAST services from the list above — never suggest anything
+   RMAST doesn't offer.
+6. Do not sound like a template with the name swapped in.
+7. Never write a URL, a link, or bracketed placeholder text for one — see
+   the note above about links being appended automatically.
+
+Write ONE message suitable for ${channel}. Return only the message text, nothing else.
+`.trim();
+}
+
+export async function generateOutreach(db: Db, lead: Lead): Promise<StepResult> {
+    const id = lead._id.toString();
+
+    if (!lead.growthScore) {
+        return {
+            ok: false,
+            message: "Analyze this lead before generating outreach messages.",
+        };
+    }
+    if (!process.env.AI_API_KEY) return aiUnavailable("message generation");
+
+    const { auditLink, demoLink } = buildOutreachLinks(lead);
+    const outreachMessages: Record<string, string> = {};
+
+    for (const channel of OUTREACH_CHANNELS) {
+        const prompt = buildOutreachPrompt(lead, channel, auditLink, demoLink);
+
+        try {
+            let message = await callGemini(prompt);
+
+            if (looksGeneric(message)) {
+                message = await callGemini(
+                    prompt +
+                    "\n\nYour previous attempt was too generic. Try again with a more specific, concrete detail from the findings."
+                );
+            }
+
+            outreachMessages[channel] = appendOutreachLinks(message.trim(), auditLink, demoLink);
+        } catch (error) {
+            // One failed channel shouldn't discard the ones that worked.
+            if (isQuotaError(error) && Object.keys(outreachMessages).length === 0) {
+                return {
+                    ok: false,
+                    message:
+                        "Outreach generation skipped: Gemini quota reached. Try again later.",
+                    quotaExhausted: true,
+                };
+            }
+            console.warn(`[pipeline] outreach failed for ${channel}:`, String(error));
+        }
+    }
+
+    if (Object.keys(outreachMessages).length === 0) {
+        return { ok: false, message: "Outreach generation produced no messages." };
+    }
+
+    await updateLead(db, id, {
+        outreachMessages,
+        outreachGeneratedAt: new Date().toISOString(),
+    });
+
+    await logActivity(
+        db,
+        id,
+        "outreach_generated",
+        `Outreach messages generated for ${Object.keys(outreachMessages).length} channel(s)`
+    );
+
+    const missing = [
+        !auditLink ? "no growth report generated yet" : null,
+        !demoLink ? "no demo generated yet" : null,
+    ].filter(Boolean);
+
+    return {
+        ok: true,
+        message: "Outreach messages generated.",
+        data: {
+            outreachMessages,
+            warning:
+                missing.length > 0
+                    ? `Generated without a link — ${missing.join(" and ")}. Run that step and regenerate outreach to include it.`
+                    : undefined,
+        },
+    };
+}
