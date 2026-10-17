@@ -63,6 +63,9 @@ const SKIP_IMAGE_RE =
 const THIRD_PARTY_LOGO_RE =
     /(google|facebook|instagram|linkedin|twitter|youtube|tiktok|whatsapp|trustpilot|tripadvisor|apple|app-?store|play-?store|visa|mastercard|paypal|stripe|rera|dld|partner|developer|award)/i;
 
+const STOCK_IMAGE_RE =
+    /(irt-cdn\.multiscreensite\.com|images\.unsplash\.com|static\.wixstatic\.com\/media\/11062b_|site_background|stock[-_]?photo|shutterstock|istockphoto|gettyimages|pexels)/i;
+
 function extractImages(html: string, base: string): { logoUrl?: string; images: string[] } {
     let logoUrl: string | undefined;
     const images: string[] = [];
@@ -76,6 +79,9 @@ function extractImages(html: string, base: string): { logoUrl?: string; images: 
         // a thumbnail that small looks blurry stretched across a hero.
         const sizeHint = url.match(/[-_](\d{2,4})w\.(jpe?g|png|webp)/i);
         if (sizeHint && Number(sizeHint[1]) < 800) return;
+        // Builders' shared stock libraries hold template defaults (Duda's
+        // "site_background_education"), not the business's own photos.
+        if (STOCK_IMAGE_RE.test(url)) return;
         seen.add(url);
         images.push(url);
     };
