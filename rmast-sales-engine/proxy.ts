@@ -48,6 +48,9 @@ export async function proxy(request: NextRequest) {
     const session = await verifySessionToken(token);
 
     let authorized = session !== null;
+    // Why a request was turned away, passed to the login page so a bounce is
+    // never silent. Carries no secrets.
+    let reason = !token ? "no-session" : !session ? "invalid-session" : "";
 
     if (session) {
         // A password change bumps this version, which revokes every session
@@ -56,7 +59,12 @@ export async function proxy(request: NextRequest) {
         const currentVersion = await getCachedPasswordVersion();
         if (currentVersion !== null && session.v !== currentVersion) {
             authorized = false;
+            reason = "signed-out";
         }
+    }
+
+    if (!authorized && token) {
+        console.warn(`[proxy] rejected session for ${pathname}: ${reason}`);
     }
 
     if (authorized) {
@@ -71,6 +79,7 @@ export async function proxy(request: NextRequest) {
     }
 
     const loginUrl = new URL("/login", request.url);
+    if (reason !== "no-session") loginUrl.searchParams.set("reason", reason);
     const response = NextResponse.redirect(loginUrl);
     // Clear an expired or revoked cookie so the browser stops sending it.
     if (token) response.cookies.delete(SESSION_COOKIE);

@@ -1,13 +1,28 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useState } from "react";
+import { useSearchParams } from "next/navigation";
+
+/** Why the dashboard sent the operator back here (set by proxy.ts). */
+const REASON_MESSAGES: Record<string, string> = {
+    "invalid-session": "Your session couldn't be verified. Please sign in again.",
+    "signed-out": "Your password was changed, so you were signed out. Please sign in again.",
+};
 
 export default function LoginPage() {
-    const router = useRouter();
+    // useSearchParams needs a Suspense boundary on a statically rendered page.
+    return (
+        <Suspense>
+            <LoginForm />
+        </Suspense>
+    );
+}
+
+function LoginForm() {
+    const reason = useSearchParams().get("reason") || "";
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
-    const [error, setError] = useState("");
+    const [error, setError] = useState(REASON_MESSAGES[reason] || "");
     const [loading, setLoading] = useState(false);
 
     async function handleSubmit(e: React.FormEvent) {
@@ -24,7 +39,10 @@ export default function LoginPage() {
         setLoading(false);
 
         if (res.ok) {
-            router.push("/dashboard");
+            // A full navigation, not router.push: it guarantees the request
+            // carries the session cookie that was just set.
+            // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+            window.location.assign("/dashboard");
         } else {
             const data = await res.json();
             setError(data.error || "Login failed");
