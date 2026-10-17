@@ -1,6 +1,6 @@
 ---
 name: run-sales-engine
-description: Run the RMAST sales funnel with Claude as the AI - find each active campaign's daily quota of new leads (small struggling brokerages and solo realtors) with web search, verify each is actively operating and research its owner, then write the activity check, analysis, enrichment, competitors, full business audit, five-page demo site and outreach drafts. Use when asked to run the sales engine, get or process leads, or for the daily scheduled run. Never sends messages; the operator clicks Send.
+description: Run the RMAST sales funnel with Claude as the AI - check the Gmail inbox for replies and send due email follow-ups, find each active campaign's daily quota of new leads (small struggling brokerages and solo realtors) with web search, verify each is actively operating and research its owner, then write the activity check, analysis, enrichment, competitors, full business audit, five-page demo site and outreach drafts. Use when asked to run the sales engine, get or process leads, or for the daily scheduled run. Never sends messages; the operator clicks Send.
 ---
 
 # Run the sales engine
@@ -9,8 +9,11 @@ You are the AI for the RMAST STUDIO sales engine (`rmast-sales-engine/`). The
 app stores, validates and renders everything; you do the research and the
 writing. All commands below run from `rmast-sales-engine/`.
 
-**Never send any message.** You only draft. The operator reviews each lead in
-the dashboard and clicks Send. Never change the Auto-Send setting.
+**The only thing you ever send is an email follow-up** (step 1b), to a lead
+the operator already emailed. First contact on every channel is the
+operator's: you draft it, they review it in the dashboard and click Send.
+Never send anything on LinkedIn, Instagram, Facebook or WhatsApp, and never
+change the Auto-Send setting.
 
 **What matters most, in order:**
 1. **The business is actively operating right now.** No lead is better than a
@@ -30,7 +33,69 @@ Vercel app), or `http://localhost:3000` if that isn't set. If it can't connect
 and `ENGINE_URL` is not set, start the local app in the background with
 `npm run dev` and retry. If the database is unreachable, stop and report it.
 
-## 1. Read the status
+## 1. Email: record replies, send follow-ups
+
+Do this first each run. Email is the engine's job after the operator sends
+the first message; LinkedIn, Instagram, Facebook and WhatsApp are always
+manual, so never act on those.
+
+```bash
+node scripts/engine.mjs email
+```
+
+This lists every emailed lead (`threads`): `email`, `ownerName`,
+`originalSubject`, `emailsSent` (dates and full text), `replied`,
+`followUpsSent`, `daysSinceLastEmail` and **`followUpDue`**. `replyTo` is the
+inbox replies go to.
+
+**a. Check the inbox for replies.** Use the Gmail connector on the `replyTo`
+inbox. For each thread with `replied: false`, search for messages from that
+lead's address since its first email (e.g. `from:owner@agency.com
+after:2026/10/17`). For each reply found, record it with the Gmail message id
+so it is never recorded twice:
+
+```bash
+node scripts/engine.mjs reply <leadId> <reply.json>
+```
+```json
+{ "content": "the reply text, without the quoted original", "receivedAt": "ISO date",
+  "sentiment": "Positive | Neutral | Negative | Not Interested", "providerMessageId": "gmail message id" }
+```
+
+Sentiment: **Positive** = interested, asks questions, wants a call; **Neutral**
+= acknowledgement or unclear; **Negative** = annoyed; **Not Interested** = a
+clear no or "stop emailing" (the app then opts them out automatically). Do
+not reply to anyone yourself; list Positive replies in the run summary so the
+operator follows up personally. Also treat an out-of-office auto-reply as no
+reply (don't record it).
+
+**If the Gmail connector is not available, record nothing and send NO
+follow-ups this run** (you can't know who replied). Say so in the summary.
+
+**b. Send due follow-ups.** For each thread with `followUpDue: true` (only
+after step a), write a follow-up and send it:
+
+```bash
+node scripts/engine.mjs follow-up <leadId> <followup.json>
+```
+```json
+{ "content": "Subject: Re: <originalSubject>\n\nHi <first name>,\n\n..." }
+```
+
+- First follow-up (`followUpsSent: 0`): 2-3 sentences. A light nudge that adds
+  one new, specific point from their audit (a different finding than the first
+  email), and repeats the offer to look at their report and demo.
+- Second follow-up (`followUpsSent: 1`): 1-2 sentences, a polite last note
+  ("I'll leave it here, the report and demo stay up if useful").
+- Copy the `Growth Report:` and `Live Demo:` link lines exactly from the first
+  email in `emailsSent` and put them at the end. Never invent or alter a link.
+- Same tone rules as outreach: friendly, specific, no pressure, no filler,
+  only RMAST's five services. Write as RMAST STUDIO.
+
+The app refuses any follow-up that isn't due (already replied, opted out, too
+soon, or past the 2 follow-up limit), so a refusal just means skip it.
+
+## 2. Read the status
 
 - `campaigns`: active campaigns, each with `niche`, `country`, `locations`,
   `dailyTarget`, `addedToday` and **`remainingToday`**, which is how many new
@@ -38,7 +103,7 @@ and `ENGINE_URL` is not set, start the local app in the background with
   Each campaign has its own quota; never shift one campaign's quota to another.
 - `leadsWaitingForWork`: leads still needing pipeline work from earlier runs.
 
-## 2. Find new leads
+## 3. Find new leads
 
 ### Who to target
 
@@ -99,10 +164,10 @@ node scripts/engine.mjs add-leads <file.json> <campaignId>
 ```
 
 Duplicates are skipped automatically and don't count toward the quota.
-Re-check `status` and keep going until each campaign's `remainingToday` is 0,
+Re-check `node scripts/engine.mjs status` and keep going until each campaign's `remainingToday` is 0,
 or searches genuinely stop turning up new active businesses.
 
-## 3. Research and process each lead
+## 4. Research and process each lead
 
 ```bash
 node scripts/engine.mjs queue 10
@@ -144,10 +209,10 @@ Do leads one at a time and submit each before starting the next, so a run
 that stops early keeps everything finished. If usage is running short, stop
 after the current lead; the rest stay queued for the next run.
 
-## 4. Log the run
+## 5. Log the run
 
 ```bash
-node scripts/engine.mjs log-run "California: added N (M fully processed). Texas: added N (M fully processed). Skipped K inactive. X still queued."
+node scripts/engine.mjs log-run "Email: R replies recorded (P positive: names), F follow-ups sent. California: added N (M processed). Texas: added N (M processed). Skipped K inactive. X still queued."
 ```
 
 Then report the same summary.

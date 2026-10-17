@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { ObjectId } from "mongodb";
 import { getDb } from "@/lib/db";
+import { withPublicLinks } from "@/lib/app-url";
 import { logActivity } from "@/lib/pipeline";
 
 const VALID_STATUSES = [
@@ -46,6 +47,17 @@ export async function GET(
 
         if (!lead) {
             return NextResponse.json({ error: "Lead not found" }, { status: 404 });
+        }
+
+        // Drafts written before deployment can hold localhost links; show the
+        // operator the same public links the send path will actually use.
+        if (lead.outreachMessages && typeof lead.outreachMessages === "object") {
+            lead.outreachMessages = Object.fromEntries(
+                Object.entries(lead.outreachMessages as Record<string, unknown>).map(([channel, text]) => [
+                    channel,
+                    typeof text === "string" ? withPublicLinks(text) : text,
+                ])
+            );
         }
 
         return NextResponse.json({ lead });

@@ -46,6 +46,8 @@ const BASE_BACKOFF_MS = 1_500;
 /** Never sleep longer than this on a single retry — the caller has a deadline. */
 const MAX_BACKOFF_MS = 20_000;
 
+import { publicAppUrl } from "@/lib/app-url";
+
 export class AiError extends Error {
     readonly status?: number;
     readonly retryable: boolean;
@@ -232,7 +234,7 @@ function jsonHeaders(apiKey: string, extra?: Record<string, string>): Record<str
  */
 async function callOpenRouter(prompt: string): Promise<string> {
     const model = process.env.OPENROUTER_MODEL || "nvidia/nemotron-3.5-lightning:free";
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL;
+    const appUrl = publicAppUrl();
 
     const data = (await fetchFallbackJson(
         "OpenRouter",

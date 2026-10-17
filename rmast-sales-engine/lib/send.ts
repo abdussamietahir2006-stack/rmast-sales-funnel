@@ -1,6 +1,7 @@
 import { Db, ObjectId } from "mongodb";
 import { Lead, logActivity } from "@/lib/pipeline";
 import { signValue } from "@/lib/signing";
+import { publicAppUrl, withPublicLinks } from "@/lib/app-url";
 
 /**
  * Outbound message delivery.
@@ -32,7 +33,7 @@ export interface SendResult {
 }
 
 function appUrl(): string {
-    return (process.env.NEXT_PUBLIC_APP_URL || "").replace(/\/$/, "");
+    return publicAppUrl();
 }
 
 export function unsubscribeUrl(leadId: string): string {
@@ -124,7 +125,8 @@ async function sendEmail(lead: Lead, content: string): Promise<SendResult> {
     }
 
     const leadId = lead._id.toString();
-    const { subject, body } = splitSubject(content, lead.companyName);
+    // Drafts written before deployment may still carry localhost links.
+    const { subject, body } = splitSubject(withPublicLinks(content), lead.companyName);
     const optOut = unsubscribeUrl(leadId);
 
     const html = `${body
@@ -144,6 +146,9 @@ async function sendEmail(lead: Lead, content: string): Promise<SendResult> {
         body: JSON.stringify({
             from,
             to: [lead.email],
+            // Lets replies land in an inbox the operator (and the engine) reads,
+            // when the sending address itself has no mailbox behind it.
+            ...(process.env.EMAIL_REPLY_TO ? { reply_to: process.env.EMAIL_REPLY_TO } : {}),
             subject,
             html,
             text: `${body}\n\n---\nUnsubscribe: ${optOut}`,

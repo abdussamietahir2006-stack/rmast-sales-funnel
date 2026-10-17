@@ -6,6 +6,7 @@ import {
     isQuotaError,
 } from "@/lib/ai";
 import { fetchExternalText } from "@/lib/safe-fetch";
+import { publicAppUrl } from "@/lib/app-url";
 import { fetchBrandAssets, type BrandAssets } from "@/lib/brand-assets";
 import { normalizeDemoSiteBrief, renderDemoSite, type DemoSiteBrief } from "@/lib/demo-site";
 import type { AuditArea, AuditReport } from "@/models/lead";
@@ -1080,7 +1081,7 @@ export const OUTREACH_CHANNELS = [
  * wrong. Every outreach message gets the real thing, appended verbatim.
  */
 function buildOutreachLinks(lead: Lead): { auditLink?: string; demoLink?: string } {
-    const appUrl = (process.env.NEXT_PUBLIC_APP_URL || "").replace(/\/$/, "");
+    const appUrl = publicAppUrl();
     return {
         auditLink: lead.auditSlug ? `${appUrl}/audit/${lead.auditSlug}` : undefined,
         demoLink: lead.demoUrl ? `${appUrl}${lead.demoUrl}` : undefined,

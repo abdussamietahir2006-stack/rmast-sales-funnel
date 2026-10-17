@@ -9,6 +9,9 @@
  *   node scripts/engine.mjs context <leadId>
  *   node scripts/engine.mjs submit <leadId> <work.json>
  *   node scripts/engine.mjs add-leads <leads.json> [campaignId]
+ *   node scripts/engine.mjs email
+ *   node scripts/engine.mjs reply <leadId> <reply.json>
+ *   node scripts/engine.mjs follow-up <leadId> <followup.json>
  *   node scripts/engine.mjs log-run "<summary>"
  */
 import { readFileSync, existsSync } from "node:fs";
@@ -94,11 +97,22 @@ switch (command) {
         }));
         break;
     }
+    case "email":
+        print(await call("GET", "/api/engine/email"));
+        break;
+    case "reply":
+        if (!args[0] || !args[1]) throw new Error("usage: reply <leadId> <reply.json>");
+        print(await call("POST", `/api/engine/leads/${args[0]}/reply`, readJson(args[1])));
+        break;
+    case "follow-up":
+        if (!args[0] || !args[1]) throw new Error("usage: follow-up <leadId> <followup.json>");
+        print(await call("POST", `/api/engine/leads/${args[0]}/follow-up`, readJson(args[1])));
+        break;
     case "log-run":
         if (!args[0]) throw new Error('usage: log-run "<summary>"');
         print(await call("POST", "/api/engine/runs", { summary: args.join(" ") }));
         break;
     default:
-        console.error("Commands: status | queue [limit] | context <id> | submit <id> <file> | add-leads <file> [campaignId] | log-run <summary>");
+        console.error("Commands: status | queue [limit] | context <id> | submit <id> <file> | add-leads <file> [campaignId] | email | reply <id> <file> | follow-up <id> <file> | log-run <summary>");
         process.exit(1);
 }

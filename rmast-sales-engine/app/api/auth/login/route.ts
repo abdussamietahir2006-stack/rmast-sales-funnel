@@ -7,7 +7,6 @@ import {
 import { checkRateLimit, clientIp, resetRateLimit } from "@/lib/rate-limit";
 import {
     SESSION_COOKIE,
-    SESSION_MAX_AGE_SECONDS,
     createSessionToken,
 } from "@/lib/session";
 
@@ -67,7 +66,9 @@ export async function POST(request: Request) {
             secure: process.env.NODE_ENV === "production",
             sameSite: "lax",
             path: "/",
-            maxAge: SESSION_MAX_AGE_SECONDS,
+            // No maxAge: a browser-session cookie, gone when the browser
+            // closes, so the company's data always asks for a fresh sign-in.
+            // The token inside still expires after SESSION_MAX_AGE_SECONDS.
         });
         return response;
     } catch (error) {

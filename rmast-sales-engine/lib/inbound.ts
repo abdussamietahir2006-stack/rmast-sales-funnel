@@ -1,4 +1,4 @@
-import { Db } from "mongodb";
+import { Db, ObjectId } from "mongodb";
 import { callGeminiJson } from "@/lib/ai";
 import { Channel, suppressLead } from "@/lib/send";
 import { logActivity } from "@/lib/pipeline";
@@ -58,6 +58,10 @@ export interface InboundMessage {
     /** Sender address or phone number, used to find the lead. */
     from?: string;
     receivedAt?: string;
+    /** Set when whoever recorded the reply (the engine) already matched the
+     *  lead and judged the sentiment; skips the lookup and the AI classifier. */
+    leadId?: string;
+    sentiment?: Sentiment;
 }
 
 /** Finds the lead an inbound message belongs to, by email or phone. */
@@ -102,7 +106,10 @@ export async function recordInboundMessage(
         if (existing) return { recorded: false, reason: "duplicate" };
     }
 
-    const lead = await findLeadForInbound(db, message.from);
+    const lead =
+        message.leadId && ObjectId.isValid(message.leadId)
+            ? await db.collection("leads").findOne({ _id: new ObjectId(message.leadId) })
+            : await findLeadForInbound(db, message.from);
     if (!lead) {
         // Keep it — an unmatched reply is still worth seeing.
         await db.collection("unmatchedInbound").insertOne({
@@ -114,7 +121,10 @@ export async function recordInboundMessage(
     }
 
     const leadId = lead._id.toString();
-    const sentiment = await classifySentiment(content);
+    const sentiment =
+        message.sentiment && SENTIMENTS.includes(message.sentiment)
+            ? message.sentiment
+            : await classifySentiment(content);
 
     await db.collection("messages").insertOne({
         leadId,
