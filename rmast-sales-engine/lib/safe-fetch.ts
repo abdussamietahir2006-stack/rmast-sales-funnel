@@ -12,7 +12,9 @@ import { isIP } from "net";
  */
 
 const MAX_REDIRECTS = 3;
-const MAX_BODY_BYTES = 512 * 1024;
+// Generous because some site builders (Gatsby, Webflow) inline over a megabyte
+// of CSS before any page content; cutting earlier left nothing to read.
+const MAX_BODY_BYTES = 3 * 1024 * 1024;
 
 export class UnsafeUrlError extends Error {
     constructor(message: string) {
@@ -113,6 +115,24 @@ export async function fetchExternalText(
     rawUrl: string,
     timeoutMs = 8000
 ): Promise<string | null> {
+    const res = await fetchExternal(rawUrl, timeoutMs);
+    if (!res) return null;
+    const body = await res.text();
+    return body.slice(0, MAX_BODY_BYTES);
+}
+
+/** Same guards as fetchExternalText, for binary content such as images. */
+export async function fetchExternalBytes(
+    rawUrl: string,
+    timeoutMs = 8000
+): Promise<Buffer | null> {
+    const res = await fetchExternal(rawUrl, timeoutMs);
+    if (!res) return null;
+    const body = Buffer.from(await res.arrayBuffer());
+    return body.length > MAX_BODY_BYTES ? null : body;
+}
+
+async function fetchExternal(rawUrl: string, timeoutMs: number): Promise<Response | null> {
     let target = rawUrl.trim();
     if (!/^https?:\/\//i.test(target)) target = `https://${target}`;
 
@@ -132,10 +152,7 @@ export async function fetchExternalText(
             continue;
         }
 
-        if (!res.ok) return null;
-
-        const body = await res.text();
-        return body.slice(0, MAX_BODY_BYTES);
+        return res.ok ? res : null;
     }
 
     return null;

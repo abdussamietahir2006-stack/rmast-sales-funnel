@@ -23,7 +23,7 @@ export interface ImportDefaults {
     location?: string;
 }
 
-interface ImportedLead {
+export interface ImportedLead {
     companyName: string;
     niche: string;
     market: string;
@@ -316,7 +316,8 @@ export function normalizeRows(
 
 export async function insertImportedLeads(
     db: Db,
-    leads: ImportedLead[]
+    leads: ImportedLead[],
+    options: { contactSource?: string; campaignId?: string } = {}
 ): Promise<{ inserted: number; skippedDuplicates: number }> {
     if (leads.length === 0) return { inserted: 0, skippedDuplicates: 0 };
 
@@ -353,7 +354,11 @@ export async function insertImportedLeads(
             website: c.website,
             phone: c.phone,
             email: c.email,
-            contactSource: "manual_import",
+            contactSource: options.contactSource || "manual_import",
+            // Unlike contactSource, which enrichment can update later, this
+            // records where the lead came from and never changes.
+            discoveredBy: options.contactSource || "manual_import",
+            ...(options.campaignId ? { campaignId: options.campaignId } : {}),
             dedupeKey: c.dedupeKey,
             status: "New",
             createdAt: now,

@@ -82,6 +82,11 @@ export interface Lead {
     /** Normalized companyName|market, used for duplicate detection. */
     dedupeKey?: string;
     ownerName?: string;
+    ownerTitle?: string;
+    /** The owner's own LinkedIn profile (linkedin.com/in/...), not the company page. */
+    ownerLinkedin?: string;
+    /** State license status found during research, e.g. "CA DRE #01234567, licensed (active)". */
+    licenseInfo?: string;
     contactSource?: "website" | "enrichment" | "google_places" | "manual";
     contactMethod?: "direct" | "social_manual" | "unreachable";
     hasVerifiedEmail?: boolean;

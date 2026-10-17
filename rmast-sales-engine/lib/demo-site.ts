@@ -75,6 +75,7 @@ export interface DemoBusiness {
     problems?: string[];
     /** The business's own logo and photos, scraped from its website. */
     logoUrl?: string;
+    logoTone?: "light" | "dark";
     images?: string[];
 }
 
@@ -265,6 +266,15 @@ function art(variant: number, cls: string, inner = "", photo?: string): string {
 function initials(name: string): string {
     const words = name.split(/\s+/).filter(Boolean);
     return (words.length > 1 ? words[0][0] + words[1][0] : name.slice(0, 2)).toUpperCase();
+}
+
+/** Gives the logo a backing only when it would otherwise vanish: a light
+ *  logo on a light page sits on the brand color, a dark (or unknown) logo on
+ *  a dark page sits on white. */
+function logoBacking(tone: DemoBusiness["logoTone"], p: DemoSiteBrief["colorPalette"]): string {
+    const darkPage = luminance(p.background) < 0.3;
+    if (tone === "light") return darkPage ? "" : `background:${p.primary};padding:6px 10px;`;
+    return darkPage ? "background:rgba(255,255,255,.94);padding:4px 8px;" : "";
 }
 
 const PAGE_IDS = ["home", "about", "services", "showcase", "contact"] as const;
@@ -489,7 +499,7 @@ background:radial-gradient(circle at 18% 22%,color-mix(in srgb,var(--accent) 75%
 .has-photo::after{width:auto;aspect-ratio:auto;inset:0;right:0;top:0;border-radius:0;filter:none;transform:none!important;background:linear-gradient(to top,rgba(0,0,0,.6),rgba(0,0,0,.05) 55%)}
 .has-photo>.art-mark,.has-photo>.ico,.has-photo>.art-num{display:none}
 .brand{display:inline-flex;align-items:center;gap:10px}
-.logo{height:38px;width:auto;max-width:120px;object-fit:contain;border-radius:8px;${luminance(p.background) < 0.3 ? "background:rgba(255,255,255,.94);padding:4px 8px;" : ""}}
+.logo{height:38px;width:auto;max-width:140px;object-fit:contain;border-radius:8px;${logoBacking(biz.logoTone, p)}}
 .art-mark{font-family:var(--hf);font-weight:800;font-size:clamp(4rem,9vw,7rem);letter-spacing:-.04em;opacity:.9;line-height:1}
 .art-num{font-family:var(--hf);font-weight:800;font-size:3.4rem;opacity:.85}
 .chips{position:absolute;left:20px;right:20px;bottom:20px;display:grid;gap:10px}

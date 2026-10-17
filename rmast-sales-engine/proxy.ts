@@ -19,7 +19,7 @@ const PUBLIC_API_PATHS = new Set([
 /**
  * Public API prefixes. These are the prospect-facing surfaces: the audit
  * report a lead is emailed, the demo page it links to, the booking form on it,
- * and the unsubscribe link. `/api/cron` and `/api/webhooks` authenticate
+ * and the unsubscribe link. `/api/cron`, `/api/engine` and `/api/webhooks` authenticate
  * themselves with a shared secret or provider signature instead of a cookie.
  */
 const PUBLIC_API_PREFIXES = [
@@ -27,6 +27,7 @@ const PUBLIC_API_PREFIXES = [
     "/api/demo/",
     "/api/public/",
     "/api/cron/",
+    "/api/engine/",
     "/api/webhooks/",
 ];
 

@@ -1,4 +1,5 @@
-import { fetchExternalText } from "@/lib/safe-fetch";
+import { inflateSync } from "zlib";
+import { fetchExternalBytes, fetchExternalText } from "@/lib/safe-fetch";
 
 /**
  * Pulls a business's own branding off its website: logo, real photos, and the
@@ -15,6 +16,9 @@ import { fetchExternalText } from "@/lib/safe-fetch";
 
 export interface BrandAssets {
     logoUrl?: string;
+    /** Whether the logo is drawn in light or dark colors, when that can be
+     *  told (inline SVGs); decides what background it is shown on. */
+    logoTone?: "light" | "dark";
     images: string[];
     /** Most prominent brand colors, strongest first, as #rrggbb. */
     colors: string[];
@@ -54,6 +58,11 @@ function bestFromSrcset(srcset: string): string | undefined {
 const SKIP_IMAGE_RE =
     /(sprite|icon|favicon|pixel|spacer|blank|placeholder|loader|spinner|badge|flag|avatar|emoji|gravatar|tracking|facebook\.com\/tr|\.svg(\?|$)|\.gif(\?|$)|data:)/i;
 
+// Review badges, app-store buttons and payment marks are often named "logo"
+// too, and are someone else's brand.
+const THIRD_PARTY_LOGO_RE =
+    /(google|facebook|instagram|linkedin|twitter|youtube|tiktok|whatsapp|trustpilot|tripadvisor|apple|app-?store|play-?store|visa|mastercard|paypal|stripe|rera|dld|partner|developer|award)/i;
+
 function extractImages(html: string, base: string): { logoUrl?: string; images: string[] } {
     let logoUrl: string | undefined;
     const images: string[] = [];
@@ -62,7 +71,7 @@ function extractImages(html: string, base: string): { logoUrl?: string; images: 
     const add = (raw: string | undefined) => {
         if (!raw) return;
         const url = resolveUrl(raw, base);
-        if (!url || seen.has(url) || SKIP_IMAGE_RE.test(url)) return;
+        if (!url || seen.has(url) || SKIP_IMAGE_RE.test(url) || /logo/i.test(url)) return;
         seen.add(url);
         images.push(url);
     };
@@ -80,10 +89,19 @@ function extractImages(html: string, base: string): { logoUrl?: string; images: 
             (srcset && bestFromSrcset(srcset)) || attr(tag, "data-src") || attr(tag, "data-lazy-src") || attr(tag, "src");
         if (!src) continue;
 
-        const label = `${attr(tag, "alt") || ""} ${attr(tag, "class") || ""} ${attr(tag, "id") || ""} ${src}`;
-        if (!logoUrl && /logo/i.test(label)) {
-            const url = resolveUrl(src, base);
-            if (url && !/^data:/i.test(src)) logoUrl = url;
+        const isDataUri = /^data:/i.test(src);
+        // A data URI's base64 can contain short words like "rera" by chance,
+        // so only a real path counts toward the label.
+        const label = `${attr(tag, "alt") || ""} ${attr(tag, "class") || ""} ${attr(tag, "id") || ""} ${isDataUri ? "" : src}`;
+        if (!logoUrl && /logo/i.test(label) && !THIRD_PARTY_LOGO_RE.test(label)) {
+            // Inline SVG logos are common on modern builds, and an SVG shown
+            // through <img> cannot run scripts, so a small one is fine as-is.
+            if (/^data:image\/(svg\+xml|png|webp);/i.test(src)) {
+                if (src.length < 60_000) logoUrl = src;
+            } else {
+                const url = resolveUrl(src, base);
+                if (url) logoUrl = url;
+            }
             continue;
         }
 
@@ -152,6 +170,9 @@ const THIRD_PARTY_COLORS = new Set([
     "#1da1f2", // Twitter
     "#ff0000", "#cc0000", // YouTube
     "#ea4335", "#4285f4", "#34a853", "#fbbc05", // Google
+    // WordPress block-editor presets, present on every WordPress site
+    "#007bff", "#0d6efd", "#dc3545", "#28a745", "#198754", "#ffc107", "#17a2b8", "#0dcaf0", // Bootstrap defaults
+    "#f78da7", "#cf2e2e", "#ff6900", "#fcb900", "#7bdcb5", "#00d084", "#8ed1fc", "#0693e3", "#abb8c3", "#9b51e0",
 ]);
 
 function extractColors(css: string, declared: string[]): string[] {
@@ -166,6 +187,9 @@ function extractColors(css: string, declared: string[]): string[] {
         counts.set(hex, (counts.get(hex) || 0) + weight);
     };
 
+    // Theme presets (WordPress and similar) declare a stock palette whether
+    // or not the site uses it.
+    css = css.replace(/--wp--preset--[w-]+s*:[^;}]*/gi, "");
     declared.forEach((c) => bump(c, 25));
     for (const m of css.matchAll(/--[\w-]*(?:primary|brand|accent|main|secondary)[\w-]*\s*:\s*(#[0-9a-f]{3,6}\b|rgba?\([^)]*\))/gi)) {
         bump(m[1], 10);
@@ -177,15 +201,160 @@ function extractColors(css: string, declared: string[]): string[] {
     const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([hex]) => hex);
     const picked: string[] = [];
     for (const hex of ranked) {
-        const { h } = hsl(parseColor(hex)!);
+        const { h, l } = hsl(parseColor(hex)!);
+        // A navy and a sky blue are different brand colors even though they
+        // share a hue, so a big lightness gap counts as distinct too.
         const distinct = picked.every((p) => {
-            const diff = Math.abs(hsl(parseColor(p)!).h - h);
-            return Math.min(diff, 360 - diff) > 25;
+            const other = hsl(parseColor(p)!);
+            const diff = Math.abs(other.h - h);
+            return Math.min(diff, 360 - diff) > 25 || Math.abs(other.l - l) > 0.25;
         });
         if (distinct) picked.push(hex);
         if (picked.length === 3) break;
     }
     return picked;
+}
+
+/** Reads the fill/stroke colors of an inline SVG logo and reports whether it
+ *  is mostly light (made for a dark header) or mostly dark. */
+/**
+ * Reads a PNG logo's pixels and reports whether its visible pixels are mostly
+ * light or mostly dark. PNG is the common case for logos (transparent
+ * background); a minimal decoder over Node's zlib avoids an image library.
+ * Returns undefined for anything it can't read confidently.
+ */
+function pngTone(buf: Buffer): BrandAssets["logoTone"] {
+    if (buf.length < 33 || buf.readUInt32BE(0) !== 0x89504e47) return undefined;
+
+    let width = 0, height = 0, depth = 0, colorType = 0, interlace = 0;
+    let palette: Buffer | undefined;
+    let paletteAlpha: Buffer | undefined;
+    const idat: Buffer[] = [];
+    for (let pos = 8; pos + 8 <= buf.length;) {
+        const length = buf.readUInt32BE(pos);
+        const type = buf.toString("ascii", pos + 4, pos + 8);
+        const data = buf.subarray(pos + 8, pos + 8 + length);
+        if (type === "IHDR") {
+            width = data.readUInt32BE(0);
+            height = data.readUInt32BE(4);
+            depth = data[8];
+            colorType = data[9];
+            interlace = data[12];
+        } else if (type === "PLTE") palette = data;
+        else if (type === "tRNS") paletteAlpha = data;
+        else if (type === "IDAT") idat.push(data);
+        else if (type === "IEND") break;
+        pos += 12 + length;
+    }
+
+    const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[colorType];
+    if (!channels || interlace !== 0 || !width || !height || width * height > 4_000_000) return undefined;
+    if (depth !== 8 && !(colorType === 3 && [1, 2, 4].includes(depth))) return undefined;
+
+    let raw: Buffer;
+    try {
+        raw = inflateSync(Buffer.concat(idat));
+    } catch {
+        return undefined;
+    }
+
+    const bpp = Math.max(1, (channels * depth) / 8);
+    const stride = Math.ceil((width * channels * depth) / 8);
+    if (raw.length < (stride + 1) * height) return undefined;
+
+    // Undo PNG's per-row filters (None, Sub, Up, Average, Paeth).
+    const pixels = Buffer.alloc(stride * height);
+    for (let y = 0; y < height; y++) {
+        const filter = raw[y * (stride + 1)];
+        const src = raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1));
+        const row = pixels.subarray(y * stride, (y + 1) * stride);
+        const prev = y > 0 ? pixels.subarray((y - 1) * stride, y * stride) : undefined;
+        for (let x = 0; x < stride; x++) {
+            const a = x >= bpp ? row[x - bpp] : 0;
+            const b = prev ? prev[x] : 0;
+            const c = prev && x >= bpp ? prev[x - bpp] : 0;
+            let value = src[x];
+            if (filter === 1) value += a;
+            else if (filter === 2) value += b;
+            else if (filter === 3) value += Math.floor((a + b) / 2);
+            else if (filter === 4) {
+                const p = a + b - c;
+                const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+                value += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+            }
+            row[x] = value & 0xff;
+        }
+    }
+
+    let light = 0;
+    let dark = 0;
+    const step = Math.max(1, Math.floor((width * height) / 20000));
+    for (let i = 0; i < width * height; i += step) {
+        const x = i % width;
+        const y = Math.floor(i / width);
+        let r: number, g: number, b: number, alpha = 255;
+        if (colorType === 3) {
+            const bitIndex = x * depth;
+            const byte = pixels[y * stride + (bitIndex >> 3)];
+            const index = (byte >> (8 - depth - (bitIndex & 7))) & ((1 << depth) - 1);
+            if (!palette || index * 3 + 2 >= palette.length) continue;
+            [r, g, b] = [palette[index * 3], palette[index * 3 + 1], palette[index * 3 + 2]];
+            if (paletteAlpha && index < paletteAlpha.length) alpha = paletteAlpha[index];
+        } else {
+            const o = y * stride + x * channels;
+            if (colorType === 0 || colorType === 4) {
+                r = g = b = pixels[o];
+                if (colorType === 4) alpha = pixels[o + 1];
+            } else {
+                [r, g, b] = [pixels[o], pixels[o + 1], pixels[o + 2]];
+                if (colorType === 6) alpha = pixels[o + 3];
+            }
+        }
+        if (alpha < 128) continue;
+        const l = hsl({ r, g, b }).l;
+        if (l > 0.7) light++;
+        else if (l < 0.35) dark++;
+    }
+
+    const visible = light + dark;
+    if (visible < 20) return undefined;
+    // An opaque logo with a baked-in background shows fine anywhere.
+    if (light / visible > 0.75) return "light";
+    if (dark / visible > 0.75) return "dark";
+    return undefined;
+}
+
+async function logoTone(logoUrl?: string): Promise<BrandAssets["logoTone"]> {
+    const svgTone = logoToneOf(logoUrl);
+    if (svgTone || !logoUrl || !/\.png(\?|$)/i.test(logoUrl)) return svgTone;
+    try {
+        const bytes = await fetchExternalBytes(logoUrl);
+        return bytes ? pngTone(bytes) : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function logoToneOf(logoUrl?: string): BrandAssets["logoTone"] {
+    const match = logoUrl?.match(/^data:image\/svg\+xml;base64,(.+)$/i);
+    if (!match) return undefined;
+    let svg: string;
+    try {
+        svg = Buffer.from(match[1], "base64").toString("utf8");
+    } catch {
+        return undefined;
+    }
+    let light = 0;
+    let dark = 0;
+    for (const m of svg.matchAll(/(?:fill|stroke)\s*[=:]\s*"?\s*(#[0-9a-f]{3,6}\b|white|black)/gi)) {
+        const value = m[1].toLowerCase();
+        const rgb = value === "white" ? { r: 255, g: 255, b: 255 } : value === "black" ? { r: 0, g: 0, b: 0 } : parseColor(value);
+        if (!rgb) continue;
+        if (hsl(rgb).l > 0.7) light++;
+        else if (hsl(rgb).l < 0.35) dark++;
+    }
+    if (light === dark) return undefined;
+    return light > dark ? "light" : "dark";
 }
 
 export async function fetchBrandAssets(website?: string): Promise<BrandAssets> {
@@ -229,5 +398,5 @@ export async function fetchBrandAssets(website?: string): Promise<BrandAssets> {
         }
     }
 
-    return { logoUrl, images, colors: extractColors(css, declared) };
+    return { logoUrl, logoTone: await logoTone(logoUrl), images, colors: extractColors(css, declared) };
 }

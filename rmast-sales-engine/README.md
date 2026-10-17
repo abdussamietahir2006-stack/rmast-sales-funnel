@@ -167,6 +167,26 @@ otherwise be spent processing a lead that's actually dead.
 Two things to check against your Vercel plan: cron frequency (Hobby allows one
 run per day, so the twice-daily schedule needs Pro) and function duration.
 
+## Running on Claude instead of an AI key
+
+The whole pipeline can run with Claude as the AI and no `AI_API_KEY` or
+`GOOGLE_PLACES_API_KEY`. A Claude Code session follows the
+`run-sales-engine` skill (`.claude/skills/run-sales-engine/SKILL.md` at the
+repo root): it finds up to 50 new leads a day for the Active campaigns with
+web search, then researches each one and writes its activity check, analysis,
+enrichment, competitors, audit, demo brief and outreach drafts. Ask for it in
+any session ("run the sales engine") or schedule it daily.
+
+It talks to the app through `/api/engine/*` (authenticated with
+`CRON_SECRET`) via `node scripts/engine.mjs`. Every submission goes through
+the same `apply*()` functions in `lib/pipeline.ts` that the Gemini pipeline
+uses, so validation and rendering are identical. The engine never sends:
+drafts wait on each lead's page for you to review and send.
+
+Outreach links use `NEXT_PUBLIC_APP_URL`, so deploy and set it to the public
+URL before sending anything; drafts generated while it points at localhost
+have localhost links and should be regenerated.
+
 ## Webhooks
 
 Point the providers at:

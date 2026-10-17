@@ -41,6 +41,9 @@ interface Lead {
     facebook?: string;
     linkedin?: string;
     ownerName?: string;
+    ownerTitle?: string;
+    ownerLinkedin?: string;
+    licenseInfo?: string;
     contactMethod?: string;
     status: string;
     activityScore?: number;
@@ -543,6 +546,18 @@ export default function LeadDetailPage() {
                 <div>
                     <p className="text-xs font-bold uppercase tracking-wider text-[#2DD4BF]">Owner</p>
                     <p className="mt-1 text-sm font-semibold text-white">{lead.ownerName || "—"}</p>
+                    {lead.ownerTitle && <p className="text-xs text-slate-400">{lead.ownerTitle}</p>}
+                    {lead.ownerLinkedin && (
+                        <a
+                            href={lead.ownerLinkedin}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs font-semibold text-[#2DD4BF] hover:underline"
+                        >
+                            Owner&apos;s LinkedIn →
+                        </a>
+                    )}
+                    {lead.licenseInfo && <p className="mt-1 text-xs text-slate-400">{lead.licenseInfo}</p>}
                 </div>
                 <div>
                     <p className="text-xs font-bold uppercase tracking-wider text-[#2DD4BF]">Website</p>

@@ -6,7 +6,7 @@ import {
     isQuotaError,
 } from "@/lib/ai";
 import { fetchExternalText } from "@/lib/safe-fetch";
-import { fetchBrandAssets } from "@/lib/brand-assets";
+import { fetchBrandAssets, type BrandAssets } from "@/lib/brand-assets";
 import { normalizeDemoSiteBrief, renderDemoSite, type DemoSiteBrief } from "@/lib/demo-site";
 import type { AuditArea, AuditReport } from "@/models/lead";
 
@@ -100,7 +100,7 @@ const INACTIVE_THRESHOLD = 30;
  *  the operator, but still allowed to proceed through the funnel normally. */
 const REVIEW_THRESHOLD = 60;
 
-async function checkWebsiteReachable(website?: string): Promise<{ reachable: boolean; note: string }> {
+export async function checkWebsiteReachable(website?: string): Promise<{ reachable: boolean; note: string }> {
     if (!website) return { reachable: false, note: "No website listed" };
     try {
         const html = await fetchExternalText(website);
@@ -172,27 +172,9 @@ Return JSON exactly:
   "verdict": "active" | "review" | "inactive" }
 `.trim();
 
-    let result: ActivityCheckResult;
+    let raw: Partial<ActivityCheckResult>;
     try {
-        const raw = await callGeminiSearchJson<Partial<ActivityCheckResult>>(prompt);
-        const activityScore = Math.max(0, Math.min(100, Math.round(Number(raw.activityScore) || 0)));
-        // Derived from the score rather than trusted verbatim from the model,
-        // so the active/review/inactive line is one consistent, tunable rule
-        // rather than whatever label the model felt like using this time.
-        const verdict: ActivityCheckResult["verdict"] =
-            activityScore < INACTIVE_THRESHOLD
-                ? "inactive"
-                : activityScore < REVIEW_THRESHOLD
-                    ? "review"
-                    : "active";
-        result = {
-            activityScore,
-            signals:
-                Array.isArray(raw.signals) && raw.signals.length > 0
-                    ? raw.signals.slice(0, 6).map((s) => String(s))
-                    : [website.note],
-            verdict,
-        };
+        raw = await callGeminiSearchJson<Partial<ActivityCheckResult>>(prompt);
     } catch (error) {
         return {
             ok: false,
@@ -200,6 +182,37 @@ Return JSON exactly:
             quotaExhausted: isQuotaError(error),
         };
     }
+
+    return applyActivity(db, lead, raw, website.note);
+}
+
+/** Saves an activity verdict, whoever produced it: Gemini above, or Claude
+ *  through the engine API (lib/engine.ts). */
+export async function applyActivity(
+    db: Db,
+    lead: Lead,
+    raw: Partial<ActivityCheckResult>,
+    fallbackSignal = "No evidence recorded"
+): Promise<StepResult> {
+    const id = lead._id.toString();
+    const activityScore = Math.max(0, Math.min(100, Math.round(Number(raw.activityScore) || 0)));
+    // Derived from the score rather than trusted verbatim from the model,
+    // so the active/review/inactive line is one consistent, tunable rule
+    // rather than whatever label the model felt like using this time.
+    const verdict: ActivityCheckResult["verdict"] =
+        activityScore < INACTIVE_THRESHOLD
+            ? "inactive"
+            : activityScore < REVIEW_THRESHOLD
+                ? "review"
+                : "active";
+    const result: ActivityCheckResult = {
+        activityScore,
+        signals:
+            Array.isArray(raw.signals) && raw.signals.length > 0
+                ? raw.signals.slice(0, 6).map((s) => String(s))
+                : [fallbackSignal],
+        verdict,
+    };
 
     await updateLead(db, id, {
         activityScore: result.activityScore,
@@ -224,7 +237,7 @@ Return JSON exactly:
 
 // --- Analyze --------------------------------------------------------------
 
-interface AnalysisResult {
+export interface AnalysisResult {
     scores: {
         website: number;
         social: number;
@@ -308,6 +321,15 @@ Return JSON in this exact shape:
         };
     }
 
+    return applyAnalysis(db, lead, result);
+}
+
+export async function applyAnalysis(
+    db: Db,
+    lead: Lead,
+    result: Partial<AnalysisResult>
+): Promise<StepResult> {
+    const id = lead._id.toString();
     const scores = Object.fromEntries(
         SCORE_KEYS.map((key) => [key, normalizeScore(result.scores?.[key])])
     ) as AnalysisResult["scores"];
@@ -394,62 +416,107 @@ Return JSON exactly:
 }
 
 export async function enrichLead(db: Db, lead: Lead): Promise<StepResult> {
-    const id = lead._id.toString();
+    const found: EnrichmentFindings = {};
 
-    let email: string | undefined = lead.email;
-    let ownerName: string | undefined = lead.ownerName;
-    let contactSource: string | undefined = lead.contactSource;
-
-    if (!email && lead.website && process.env.AI_API_KEY) {
+    if (!lead.email && lead.website && process.env.AI_API_KEY) {
         const scraped = await scrapeWebsiteContact(lead.website);
-        if (scraped.email) {
-            email = scraped.email;
-            contactSource = "website";
-        }
-        if (scraped.ownerName) {
-            ownerName = scraped.ownerName;
-        }
+        found.email = scraped.email;
+        found.ownerName = scraped.ownerName;
     }
 
-    if (!email && lead.website && process.env.ENRICHMENT_API_KEY) {
+    if (!lead.email && lead.website && process.env.ENRICHMENT_API_KEY) {
         // --- Hunter.io / Apollo.io lookup goes here once that key is added ---
     }
 
-    const phone = lead.phone;
-    const hasDirectContact = !!email || !!phone;
-
-    let instagram = lead.instagram;
-    let facebook = lead.facebook;
-    let linkedin = lead.linkedin;
-    let contactMethod: "direct" | "social_manual" | "unreachable" = "direct";
-
+    const hasDirectContact = !!(lead.email || found.email) || !!lead.phone;
     if (!hasDirectContact && process.env.AI_API_KEY) {
-        const found = await findSocialProfiles(lead.companyName, lead.location);
-        instagram = found.instagram || instagram;
-        facebook = found.facebook || facebook;
-        linkedin = found.linkedin || linkedin;
-
-        const hasSocial = !!instagram || !!facebook || !!linkedin;
-        contactMethod = hasSocial ? "social_manual" : "unreachable";
-    } else if (!hasDirectContact) {
-        const hasSocial = !!instagram || !!facebook || !!linkedin;
-        contactMethod = hasSocial ? "social_manual" : "unreachable";
+        Object.assign(found, await findSocialProfiles(lead.companyName, lead.location));
     }
 
+    return applyEnrichment(db, lead, found);
+}
+
+export interface EnrichmentFindings {
+    email?: string;
+    ownerName?: string;
+    ownerTitle?: string;
+    ownerLinkedin?: string;
+    licenseInfo?: string;
+    phone?: string;
+    instagram?: string;
+    facebook?: string;
+    linkedin?: string;
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Only a real-looking profile URL on the platform's own domain gets stored;
+ *  anything else (a search page, a guess) is dropped. */
+function cleanProfileUrl(value: unknown, domain: string): string | undefined {
+    if (typeof value !== "string" || !value.trim()) return undefined;
+    try {
+        const url = new URL(value.trim());
+        return url.hostname.replace(/^www\./, "").endsWith(domain) ? url.toString() : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Merges newly found contact details into the lead, never overwriting ones it
+ *  already has, then works out how the lead can be reached. */
+export async function applyEnrichment(
+    db: Db,
+    lead: Lead,
+    found: EnrichmentFindings
+): Promise<StepResult> {
+    const id = lead._id.toString();
+
+    const foundEmail = typeof found.email === "string" && EMAIL_RE.test(found.email.trim()) ? found.email.trim() : "";
+    const email: string = lead.email || foundEmail;
+    const ownerName: string = lead.ownerName || (typeof found.ownerName === "string" ? found.ownerName.trim() : "");
+    const phone: string = lead.phone || (typeof found.phone === "string" ? found.phone.trim() : "");
+    const contactSource: string =
+        lead.email ? lead.contactSource || "google_places" : foundEmail ? "website" : lead.contactSource || "google_places";
+
+    const text = (v: unknown, max: number) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+    const ownerTitle: string = lead.ownerTitle || text(found.ownerTitle, 120);
+    // Must be a personal profile (/in/), not a company page or search result.
+    const foundOwnerLinkedin = cleanProfileUrl(found.ownerLinkedin, "linkedin.com");
+    const ownerLinkedin: string =
+        lead.ownerLinkedin || (foundOwnerLinkedin && /linkedin\.com\/in\//i.test(foundOwnerLinkedin) ? foundOwnerLinkedin : "");
+    // License status can change, so a fresh finding replaces the old one.
+    const licenseInfo: string = text(found.licenseInfo, 200) || lead.licenseInfo || "";
+
+    const instagram = lead.instagram || cleanProfileUrl(found.instagram, "instagram.com") || "";
+    const facebook = lead.facebook || cleanProfileUrl(found.facebook, "facebook.com") || "";
+    const linkedin = lead.linkedin || cleanProfileUrl(found.linkedin, "linkedin.com") || "";
+
+    const hasDirectContact = !!email || !!phone;
+    const hasSocial = !!instagram || !!facebook || !!linkedin;
+    const contactMethod: "direct" | "social_manual" | "unreachable" = hasDirectContact
+        ? "direct"
+        : hasSocial
+            ? "social_manual"
+            : "unreachable";
+
     await updateLead(db, id, {
-        email: email || lead.email || "",
-        ownerName: ownerName || lead.ownerName || "",
-        contactSource: contactSource || lead.contactSource || "google_places",
-        instagram: instagram || lead.instagram || "",
-        facebook: facebook || lead.facebook || "",
-        linkedin: linkedin || lead.linkedin || "",
+        email,
+        ownerName,
+        ownerTitle,
+        ownerLinkedin,
+        licenseInfo,
+        phone,
+        contactSource,
+        instagram,
+        facebook,
+        linkedin,
         contactMethod,
         enrichedAt: new Date().toISOString(),
     });
 
     const statusMessage =
         contactMethod === "direct"
-            ? `Enrichment complete (source: ${contactSource || "google_places"})`
+            ? `Enrichment complete (source: ${contactSource})`
             : contactMethod === "social_manual"
                 ? "No email/phone found — real social profiles found via search for manual outreach"
                 : "No email, phone, or social profiles found — flagged as unreachable";
@@ -513,7 +580,6 @@ export async function findCompetitorsForLead(
     db: Db,
     lead: Lead
 ): Promise<StepResult> {
-    const id = lead._id.toString();
 
     if (!lead.growthScore) {
         return { ok: false, message: "Analyze this lead before finding competitors." };
@@ -556,6 +622,19 @@ Return JSON exactly:
             : `Competitor search skipped due to an error: ${String(error)}`;
     }
 
+    return applyCompetitors(db, lead, competitors, skippedReason, quotaExhausted);
+}
+
+export async function applyCompetitors(
+    db: Db,
+    lead: Lead,
+    raw: unknown,
+    skippedReason = "",
+    quotaExhausted = false
+): Promise<StepResult> {
+    const id = lead._id.toString();
+    const competitors = sanitizeCompetitors(Array.isArray(raw) ? (raw as RawCompetitor[]) : []);
+
     await updateLead(db, id, {
         competitors,
         competitorsGeneratedAt: new Date().toISOString(),
@@ -586,7 +665,7 @@ Return JSON exactly:
 // competitors, activity signals and a scrape of their homepage), and is told
 // to report missing data as a finding rather than invent details.
 
-const AUDIT_AREAS = [
+export const AUDIT_AREAS = [
     "Website & User Experience",
     "Search & Local Visibility",
     "Social Media & Content",
@@ -663,7 +742,6 @@ function normalizeAuditReport(raw: Partial<AuditReport> | null | undefined, lead
 }
 
 export async function generateAudit(db: Db, lead: Lead): Promise<StepResult> {
-    const id = lead._id.toString();
 
     if (!lead.growthScore) {
         return { ok: false, message: "Analyze this lead before generating an audit." };
@@ -736,10 +814,9 @@ Return JSON exactly:
 }
 `.trim();
 
-    let auditReport: AuditReport;
+    let raw: Partial<AuditReport>;
     try {
-        const raw = await callGeminiJson<Partial<AuditReport>>(prompt);
-        auditReport = normalizeAuditReport(raw, lead);
+        raw = await callGeminiJson<Partial<AuditReport>>(prompt);
     } catch (error) {
         return {
             ok: false,
@@ -747,6 +824,17 @@ Return JSON exactly:
             quotaExhausted: isQuotaError(error),
         };
     }
+
+    return applyAudit(db, lead, raw);
+}
+
+export async function applyAudit(
+    db: Db,
+    lead: Lead,
+    raw: Partial<AuditReport>
+): Promise<StepResult> {
+    const id = lead._id.toString();
+    const auditReport = normalizeAuditReport(raw, lead);
 
     if (auditReport.areas.length === 0) {
         return { ok: false, message: "Audit generation returned no findings. Try again." };
@@ -781,14 +869,15 @@ Return JSON exactly:
  *  one — grounds the brief in what's actually there instead of guessing from
  *  niche alone. Best-effort: a failed fetch just means a plainer brief, same
  *  as the SSRF-guarded fetch already used during enrichment. */
-async function scrapeHomepageSnippet(website?: string): Promise<string> {
+export async function scrapeHomepageSnippet(website?: string): Promise<string> {
     if (!website) return "";
     try {
         const html = await fetchExternalText(website);
         if (!html) return "";
         return html
-            .replace(/<script[\s\S]*?<\/script>/gi, " ")
-            .replace(/<style[\s\S]*?<\/style>/gi, " ")
+            // "|$" also strips a block left unclosed where the page was cut off.
+            .replace(/<script[\s\S]*?(<\/script>|$)/gi, " ")
+            .replace(/<style[\s\S]*?(<\/style>|$)/gi, " ")
             .replace(/<[^>]+>/g, " ")
             .replace(/\s+/g, " ")
             .trim()
@@ -799,7 +888,6 @@ async function scrapeHomepageSnippet(website?: string): Promise<string> {
 }
 
 export async function generateDemo(db: Db, lead: Lead): Promise<StepResult> {
-    const id = lead._id.toString();
 
     if (!lead.growthScore) {
         return { ok: false, message: "Analyze this lead before generating a demo." };
@@ -885,6 +973,28 @@ Return JSON exactly:
   "ctaHeadline": "...", "ctaText": "..." }
 `.trim();
 
+    let rawBrief: unknown;
+    try {
+        rawBrief = await callGeminiJson<unknown>(briefPrompt);
+    } catch (error) {
+        return {
+            ok: false,
+            message: `Demo generation failed: ${String(error)}`,
+            quotaExhausted: isQuotaError(error),
+        };
+    }
+
+    return applyDemoBrief(db, lead, rawBrief, brand);
+}
+
+/** Renders a demo site from a brief, whoever wrote it, and saves it. */
+export async function applyDemoBrief(
+    db: Db,
+    lead: Lead,
+    rawBrief: unknown,
+    brand: BrandAssets
+): Promise<StepResult> {
+    const id = lead._id.toString();
     const business = {
         companyName: String(lead.companyName),
         niche: String(lead.niche || ""),
@@ -894,19 +1004,10 @@ Return JSON exactly:
         email: typeof lead.email === "string" ? lead.email : undefined,
         problems: Array.isArray(lead.problems) ? (lead.problems as string[]) : [],
         logoUrl: brand.logoUrl,
+        logoTone: brand.logoTone,
         images: brand.images,
     };
-
-    let brief: DemoSiteBrief;
-    try {
-        brief = normalizeDemoSiteBrief(await callGeminiJson<unknown>(briefPrompt), business);
-    } catch (error) {
-        return {
-            ok: false,
-            message: `Demo generation failed: ${String(error)}`,
-            quotaExhausted: isQuotaError(error),
-        };
-    }
+    const brief: DemoSiteBrief = normalizeDemoSiteBrief(rawBrief, business);
 
     // The prompt asks for the brand's own colors; this makes sure of it in
     // case the model drifted to a palette of its own.
@@ -1065,7 +1166,6 @@ Write ONE message suitable for ${channel}. Return only the message text, nothing
 }
 
 export async function generateOutreach(db: Db, lead: Lead): Promise<StepResult> {
-    const id = lead._id.toString();
 
     if (!lead.growthScore) {
         return {
@@ -1091,7 +1191,7 @@ export async function generateOutreach(db: Db, lead: Lead): Promise<StepResult> 
                 );
             }
 
-            outreachMessages[channel] = appendOutreachLinks(message.trim(), auditLink, demoLink);
+            outreachMessages[channel] = message.trim();
         } catch (error) {
             // One failed channel shouldn't discard the ones that worked.
             if (isQuotaError(error) && Object.keys(outreachMessages).length === 0) {
@@ -1103,6 +1203,26 @@ export async function generateOutreach(db: Db, lead: Lead): Promise<StepResult> 
                 };
             }
             console.warn(`[pipeline] outreach failed for ${channel}:`, String(error));
+        }
+    }
+
+    return applyOutreach(db, lead, outreachMessages);
+}
+
+/** Saves outreach drafts (one per channel), appending the real audit and demo
+ *  links here rather than trusting whoever wrote the copy to include them. */
+export async function applyOutreach(
+    db: Db,
+    lead: Lead,
+    raw: Record<string, unknown>
+): Promise<StepResult> {
+    const id = lead._id.toString();
+    const { auditLink, demoLink } = buildOutreachLinks(lead);
+    const outreachMessages: Record<string, string> = {};
+    for (const channel of OUTREACH_CHANNELS) {
+        const message = raw[channel];
+        if (typeof message === "string" && message.trim()) {
+            outreachMessages[channel] = appendOutreachLinks(message.trim(), auditLink, demoLink);
         }
     }
 
