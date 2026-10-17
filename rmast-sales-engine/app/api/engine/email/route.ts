@@ -12,7 +12,7 @@ export async function GET(request: Request) {
         const threads = await getEmailThreads(await getDb());
         return NextResponse.json({
             followUpDelaysDays: FOLLOW_UP_DELAYS_DAYS,
-            replyTo: process.env.EMAIL_REPLY_TO || process.env.EMAIL_FROM || null,
+            replyTo: process.env.GMAIL_USER || process.env.EMAIL_REPLY_TO || process.env.EMAIL_FROM || null,
             threads,
         });
     } catch (error) {

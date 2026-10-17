@@ -1,4 +1,5 @@
 import { Db, ObjectId } from "mongodb";
+import nodemailer from "nodemailer";
 import { Lead, logActivity } from "@/lib/pipeline";
 import { signValue } from "@/lib/signing";
 import { publicAppUrl, withPublicLinks } from "@/lib/app-url";
@@ -107,16 +108,29 @@ function escapeHtml(value: string): string {
         .replace(/"/g, "&quot;");
 }
 
-async function sendEmail(lead: Lead, content: string): Promise<SendResult> {
+export interface EmailOptions {
+    /** Message-ID of an earlier email in the thread, so a follow-up shows up
+     *  as a reply to it in the recipient's inbox (Gmail sending only). */
+    inReplyTo?: string;
+}
+
+/** Gmail sending is configured: the operator's own mailbox sends, and replies
+ *  come straight back to it. */
+function gmailConfigured(): boolean {
+    return Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
+}
+
+async function sendEmail(lead: Lead, content: string, options: EmailOptions = {}): Promise<SendResult> {
+    const useGmail = gmailConfigured();
     const apiKey = process.env.EMAIL_API_KEY;
     const from = process.env.EMAIL_FROM;
 
-    if (!apiKey || !from) {
+    if (!useGmail && (!apiKey || !from)) {
         return {
             ok: false,
             notConfigured: true,
             message:
-                "Email sending is not configured. Add EMAIL_API_KEY and EMAIL_FROM to enable it.",
+                "Email sending is not configured. Add GMAIL_USER and GMAIL_APP_PASSWORD (send from your Gmail), or EMAIL_API_KEY and EMAIL_FROM (Resend).",
         };
     }
 
@@ -136,6 +150,17 @@ async function sendEmail(lead: Lead, content: string): Promise<SendResult> {
 <p style="font-size:12px;color:#6b7280;margin-top:24px">
   Not interested? <a href="${optOut}">Unsubscribe</a> and we won't contact you again.
 </p>`;
+    const text = `${body}\n\n---\nUnsubscribe: ${optOut}`;
+    const unsubscribeHeaders = {
+        // Required for bulk mail by Gmail and Yahoo, and the clearest
+        // opt-out signal under CAN-SPAM and PECR.
+        "List-Unsubscribe": `<${optOut}>`,
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    };
+
+    if (useGmail) {
+        return sendViaGmail(lead.email, subject, html, text, unsubscribeHeaders, options);
+    }
 
     const res = await fetch("https://api.resend.com/emails", {
         method: "POST",
@@ -151,13 +176,8 @@ async function sendEmail(lead: Lead, content: string): Promise<SendResult> {
             ...(process.env.EMAIL_REPLY_TO ? { reply_to: process.env.EMAIL_REPLY_TO } : {}),
             subject,
             html,
-            text: `${body}\n\n---\nUnsubscribe: ${optOut}`,
-            headers: {
-                // Required for bulk mail by Gmail and Yahoo, and the clearest
-                // opt-out signal under CAN-SPAM and PECR.
-                "List-Unsubscribe": `<${optOut}>`,
-                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
-            },
+            text,
+            headers: unsubscribeHeaders,
         }),
         signal: AbortSignal.timeout(20_000),
     });
@@ -173,6 +193,46 @@ async function sendEmail(lead: Lead, content: string): Promise<SendResult> {
         message: `Email sent to ${lead.email}`,
         providerMessageId: data?.id,
     };
+}
+
+/**
+ * Sends through the operator's Gmail account over SMTP, using a Google App
+ * Password (never the account password). The email appears in their Gmail
+ * Sent folder, replies arrive in their inbox, and the returned Message-ID
+ * lets follow-ups thread under the original.
+ */
+async function sendViaGmail(
+    to: string,
+    subject: string,
+    html: string,
+    text: string,
+    headers: Record<string, string>,
+    options: EmailOptions
+): Promise<SendResult> {
+    const user = process.env.GMAIL_USER!;
+    const transport = nodemailer.createTransport({
+        host: "smtp.gmail.com",
+        port: 465,
+        secure: true,
+        auth: { user, pass: process.env.GMAIL_APP_PASSWORD!.replace(/\s+/g, "") },
+    });
+
+    try {
+        const info = await transport.sendMail({
+            from: { name: process.env.EMAIL_FROM_NAME || "RMAST STUDIO", address: user },
+            to,
+            subject,
+            html,
+            text,
+            headers,
+            ...(options.inReplyTo ? { inReplyTo: options.inReplyTo, references: [options.inReplyTo] } : {}),
+        });
+        return { ok: true, message: `Email sent to ${to}`, providerMessageId: info.messageId };
+    } catch (error) {
+        return { ok: false, message: `Gmail rejected the send: ${String(error)}` };
+    } finally {
+        transport.close();
+    }
 }
 
 // --- WhatsApp (Meta Cloud API) --------------------------------------------
@@ -247,7 +307,8 @@ export async function sendMessage(
     db: Db,
     lead: Lead,
     channel: Channel,
-    content: string
+    content: string,
+    emailOptions: EmailOptions = {}
 ): Promise<SendResult> {
     const leadId = lead._id.toString();
 
@@ -261,7 +322,7 @@ export async function sendMessage(
     let result: SendResult;
 
     if (channel === "email") {
-        result = await sendEmail(lead, content);
+        result = await sendEmail(lead, content, emailOptions);
     } else if (channel === "whatsapp") {
         result = await sendWhatsApp(lead, content);
     } else {

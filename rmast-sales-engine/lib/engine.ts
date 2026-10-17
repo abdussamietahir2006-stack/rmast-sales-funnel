@@ -239,7 +239,7 @@ export async function getEmailThreads(db: Db) {
         .collection("messages")
         .aggregate<{
             _id: string;
-            outbound: { content: string; sentAt: string }[];
+            outbound: { content: string; sentAt: string; providerMessageId?: string }[];
             inboundCount: number;
             lastInboundAt: string | null;
         }>([
@@ -250,7 +250,7 @@ export async function getEmailThreads(db: Db) {
                     _id: "$leadId",
                     outbound: {
                         $push: {
-                            $cond: [{ $eq: ["$direction", "outbound"] }, { content: "$content", sentAt: "$sentAt" }, "$$REMOVE"],
+                            $cond: [{ $eq: ["$direction", "outbound"] }, { content: "$content", sentAt: "$sentAt", providerMessageId: "$providerMessageId" }, "$$REMOVE"],
                         },
                     },
                     inboundCount: { $sum: { $cond: [{ $eq: ["$direction", "inbound"] }, 1, 0] } },
@@ -284,6 +284,11 @@ export async function getEmailThreads(db: Db) {
                 lastReplyAt: thread.lastInboundAt,
                 originalSubject: subjectOf(thread.outbound[0].content, lead.companyName),
                 emailsSent: thread.outbound.map((m) => ({ sentAt: m.sentAt, content: m.content })),
+                // An SMTP Message-ID (<...@...>) of the opening email, when it was
+                // sent through Gmail, so follow-ups can thread under it.
+                threadMessageId: /^<.+@.+>$/.test(thread.outbound[0].providerMessageId || "")
+                    ? thread.outbound[0].providerMessageId
+                    : undefined,
                 followUpsSent,
                 lastEmailAt,
                 daysSinceLastEmail,
@@ -351,7 +356,9 @@ export async function sendFollowUp(db: Db, id: string, content: unknown) {
     const lead = await getLead(db, id);
     if (!lead) return { ok: false, message: "Lead not found" };
 
-    const result = await sendMessage(db, lead, "email", content.trim());
+    const result = await sendMessage(db, lead, "email", content.trim(), {
+        inReplyTo: thread.threadMessageId,
+    });
     if (result.ok) {
         await db.collection("leads").updateOne(
             { _id: lead._id },

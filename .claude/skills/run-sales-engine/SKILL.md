@@ -46,7 +46,8 @@ node scripts/engine.mjs email
 This lists every emailed lead (`threads`): `email`, `ownerName`,
 `originalSubject`, `emailsSent` (dates and full text), `replied`,
 `followUpsSent`, `daysSinceLastEmail` and **`followUpDue`**. `replyTo` is the
-inbox replies go to.
+inbox replies go to: the operator's Gmail, **rmaststudio@gmail.com**, which
+also sends the emails (they appear in its Sent folder).
 
 **a. Check the inbox for replies.** Use the Gmail connector on the `replyTo`
 inbox. For each thread with `replied: false`, search for messages from that
