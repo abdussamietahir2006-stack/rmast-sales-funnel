@@ -162,6 +162,9 @@ export default function LeadDetailPage() {
 
     const [sendingChannel, setSendingChannel] = useState<string | null>(null);
     const [sendMessage, setSendMessage] = useState("");
+    // Which channel the last send was for and whether it worked, so the
+    // result shows next to that Send button, in red when it failed.
+    const [sendResult, setSendResult] = useState<{ channel: string; ok: boolean } | null>(null);
 
     const [newNote, setNewNote] = useState("");
     const [savingNote, setSavingNote] = useState(false);
@@ -333,13 +336,15 @@ export default function LeadDetailPage() {
         if (!content) return;
         setSendingChannel(channel);
         setSendMessage("");
+        setSendResult(null);
 
         const res = await fetch(`/api/leads/${params.id}/messages`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ channel, content }),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        setSendResult({ channel, ok: res.ok });
 
         if (!res.ok) {
             setSendMessage(data.error || "Something went wrong.");
@@ -475,7 +480,17 @@ export default function LeadDetailPage() {
             {auditMessage && <div className="rounded-lg border border-[#B45309]/40 bg-[#B45309]/10 px-4 py-2.5 text-xs text-[#FDE68A]">{auditMessage}</div>}
             {demoMessage && <div className="rounded-lg border border-[#164E53]/40 bg-[#164E53]/10 px-4 py-2.5 text-xs text-[#2DD4BF]">{demoMessage}</div>}
             {outreachMessage && <div className="rounded-lg border border-[#1E3A2B]/40 bg-[#1E3A2B]/10 px-4 py-2.5 text-xs text-[#86EFAC]">{outreachMessage}</div>}
-            {sendMessage && <div className="rounded-lg border border-[#059669]/40 bg-[#059669]/10 px-4 py-2.5 text-xs text-[#34D399]">{sendMessage}</div>}
+            {sendMessage && (
+                <div
+                    className={
+                        sendResult && !sendResult.ok
+                            ? "rounded-lg border border-[#9F1239]/40 bg-[#9F1239]/10 px-4 py-2.5 text-xs text-[#FB7185]"
+                            : "rounded-lg border border-[#059669]/40 bg-[#059669]/10 px-4 py-2.5 text-xs text-[#34D399]"
+                    }
+                >
+                    {sendMessage}
+                </div>
+            )}
 
             {isSocialManual && (
                 <div className="rounded-xl border border-[#B45309]/40 bg-[#1B1710] p-4 text-xs text-[#FDE68A]">
@@ -772,6 +787,19 @@ export default function LeadDetailPage() {
                                     <p className="text-slate-200 leading-relaxed text-xs font-mono bg-[#070C0E] p-3 rounded-md border border-[#132E32]">
                                         {content || "Not generated yet."}
                                     </p>
+                                    {sendResult?.channel === key && sendMessage && (
+                                        <p
+                                            role="status"
+                                            className={`mt-2 rounded-md px-3 py-2 text-xs font-semibold ${
+                                                sendResult.ok
+                                                    ? "bg-[#059669]/10 text-[#34D399]"
+                                                    : "bg-[#9F1239]/10 text-[#FB7185]"
+                                            }`}
+                                        >
+                                            {sendResult.ok ? "✓ " : "✕ Not sent: "}
+                                            {sendMessage}
+                                        </p>
+                                    )}
                                 </div>
                             );
                         })}

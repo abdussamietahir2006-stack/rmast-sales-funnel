@@ -130,7 +130,7 @@ async function sendEmail(lead: Lead, content: string, options: EmailOptions = {}
             ok: false,
             notConfigured: true,
             message:
-                "Email sending is not configured. Add GMAIL_USER and GMAIL_APP_PASSWORD (send from your Gmail), or EMAIL_API_KEY and EMAIL_FROM (Resend).",
+                "Email sending is not set up yet. In Vercel, add GMAIL_USER and GMAIL_APP_PASSWORD under Settings > Environment Variables, then redeploy.",
         };
     }
 
